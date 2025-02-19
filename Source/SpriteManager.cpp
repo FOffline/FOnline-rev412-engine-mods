@@ -1556,8 +1556,6 @@ AnyFrames* SpriteManager::LoadAnimation( const char* fname, int path_type, int f
     AnyFrames* result = NULL;
     if( Str::CompareCaseCount( ext, "fr", 2 ) )
         result = LoadAnimationFrm( fname, path_type, dir, FLAG( flags, ANIM_FRM_ANIM_PIX ) );
-    else if( Str::CompareCase( ext, "rix" ) )
-        result = LoadAnimationRix( fname, path_type );
     else if( Str::CompareCase( ext, "fofrm" ) )
         result = LoadAnimationFofrm( fname, path_type, dir );
     else if( Str::CompareCase( ext, "art" ) )

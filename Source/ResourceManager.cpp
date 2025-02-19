@@ -22,7 +22,6 @@ void ResourceManager::Refresh()
 
         // Splashes
         StrVec splashes;
-        FileManager::GetFolderFileNames( FileManager::GetPath( PT_ART_SPLASH ), true, "rix", splashes );
         FileManager::GetFolderFileNames( FileManager::GetPath( PT_ART_SPLASH ), true, "png", splashes );
         FileManager::GetFolderFileNames( FileManager::GetPath( PT_ART_SPLASH ), true, "jpg", splashes );
         for( auto it = splashes.begin(), end = splashes.end(); it != end; ++it )
@@ -67,7 +66,6 @@ void ResourceManager::Refresh()
 
             // Splashes
             StrVec splashes;
-            pfile->GetFileNames( FileManager::GetPath( PT_ART_SPLASH ), true, "rix", splashes );
             pfile->GetFileNames( FileManager::GetPath( PT_ART_SPLASH ), true, "png", splashes );
             pfile->GetFileNames( FileManager::GetPath( PT_ART_SPLASH ), true, "jpg", splashes );
             for( auto it = splashes.begin(), end = splashes.end(); it != end; ++it )
