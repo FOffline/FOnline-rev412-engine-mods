@@ -247,6 +247,7 @@ int FOClient::InitIface()
     IfaceLoadRect2( IntAC, "IntAc", IntX, IntY );
     IfaceLoadRect2( IntAP, "IntAp", IntX, IntY );
     IfaceLoadRect2( IntBreakTime, "IntBreakTime", IntX, IntY );
+	IfaceLoadRect2( IntAPText, "IntApText", IntX, IntY );
     IntAPstepX = IfaceIni.GetInt( "IntApStepX", 9 );
     IntAPstepY = IfaceIni.GetInt( "IntApStepY", 0 );
     IntAPMax = IfaceIni.GetInt( "IntApMax", 10 );
@@ -2836,6 +2837,24 @@ void FOClient::IntDraw()
         for( int i = 0, j = abs( Chosen->GetParam( ST_CURRENT_AP ) ); i < j && i < IntAPMax; i++ )
             SprMngr.DrawSprite( IntDiodeR, IntAP[ 0 ] + i * IntAPstepX, IntAP[ 1 ] + i * IntAPstepY );
     }
+	
+	// Ap numbers
+    char ap_str[32];
+    int action_points = Chosen->GetParam(ST_CURRENT_AP);
+    if (action_points < 0) 
+	{
+    Str::Format(ap_str, "%02d", -action_points); 
+    Str::ChangeValue(ap_str, 0x20);
+    } else {
+    Str::Format(ap_str, "%02d", action_points);
+    if (action_points <= 10) 
+	{
+        Str::ChangeValue(ap_str, 0x10); 
+    }
+    }
+    SprMngr.DrawStr(IntAPText, ap_str, 0, COLOR_IFACE, FONT_NUM);
+
+
 
     // Move Ap
     if( IsTurnBased )

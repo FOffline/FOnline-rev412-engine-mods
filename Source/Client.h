@@ -809,7 +809,7 @@ public:
     Rect       IntBItem, IntWApCost;
     Rect       IntBChangeSlot, IntBInv, IntBMenu, IntBSkill, IntBMap, IntBChar, IntBPip, IntBFix;
     Rect       IntWMess, IntWMessLarge;
-    Rect       IntAP, IntHP, IntAC, IntBreakTime;
+    Rect       IntAP, IntHP, IntAC, IntBreakTime, IntAPText;
     int        IntAPstepX, IntAPstepY, IntAPMax;
     AnyFrames* IntBItemPicDn;
     int        IntBItemOffsX, IntBItemOffsY;
