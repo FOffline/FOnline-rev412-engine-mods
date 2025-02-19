@@ -233,6 +233,8 @@ int FOClient::InitIface()
     IfaceLoadRect2( IntBMessFilter2, "IntMessFilter2", IntX, IntY );
     IfaceLoadRect2( IntBMessFilter3, "IntMessFilter3", IntX, IntY );
     IfaceLoadRect2( IntBItem, "IntItem", IntX, IntY );
+	IfaceLoadRect2( IntBSecond, "IntSecond", IntX, IntY );
+	IfaceLoadRect2( IntBArmor, "IntArmor", IntX, IntY );
     IfaceLoadRect2( IntBChangeSlot, "IntChangeSlot", IntX, IntY );
     IfaceLoadRect2( IntBInv, "IntInv", IntX, IntY );
     IfaceLoadRect2( IntBMenu, "IntMenu", IntX, IntY );
@@ -261,6 +263,15 @@ int FOClient::InitIface()
     IntWWearProcentStr = Rect( IntBItem, 7, 19 );
     IfaceLoadRect2( IntWAmmoCountStr, "IntAmmoCountText", IntX, IntY );
     IfaceLoadRect2( IntWWearProcentStr, "IntWearProcentText", IntX, IntY );
+	IfaceLoadRect2( IntWSecondAmmoCount, "IntSecondAmmoCount", IntX, IntY );
+    IfaceLoadRect2( IntWSecondWearProcent, "IntSecondWearProcent", IntX, IntY );
+    IntWSecondAmmoCountStr = Rect( IntBSecond, 7, 8 );
+    IntWSecondWearProcentStr = Rect( IntBSecond, 7, 19 );
+    IfaceLoadRect2( IntWSecondAmmoCountStr, "IntSecondAmmoCountText", IntX, IntY );
+    IfaceLoadRect2( IntWSecondWearProcentStr, "IntSecondWearProcentText", IntX, IntY );
+	IfaceLoadRect2( IntWArmorWearProcent, "IntArmorWearProcent", IntX, IntY );
+	IntWArmorWearProcentStr = Rect( IntBArmor, 7, 8 );
+	IfaceLoadRect2( IntWArmorWearProcentStr, "IntArmorWearProcentText", IntX, IntY );
     IntVisible = true;
     IntAddMess = false;
     MessBoxFilters.clear();
@@ -269,6 +280,10 @@ int FOClient::InitIface()
     MessBoxScrollLines = 0;
     IntBItemOffsX = IfaceIni.GetInt( "IntItemOffsX", 0 );
     IntBItemOffsY = IfaceIni.GetInt( "IntItemOffsY", -2 );
+	IntBArmorOffsX = IfaceIni.GetInt( "IntArmorOffsX", 0 );
+    IntBArmorOffsY = IfaceIni.GetInt( "IntArmorOffsY", -2 );
+	IntBSecondOffsX = IfaceIni.GetInt( "IntSecondOffsX", 0 );
+    IntBSecondOffsY = IfaceIni.GetInt( "IntSecondOffsY", -2 );
     IntAimX = IfaceIni.GetInt( "IntAimX", 0 );
     IntAimX += IntX;
     IntAimY = IfaceIni.GetInt( "IntAimY", 0 );
@@ -281,6 +296,12 @@ int FOClient::InitIface()
     IntWearPoints.clear();
     IntAmmoTick = 0;
     IntWearTick = 0;
+	IntArmorWearPoints.clear();
+	IntArmorWearTick = 0;
+	IntSecondAmmoPoints.clear();
+    IntSecondWearPoints.clear();
+	IntSecondAmmoTick = 0;
+    IntSecondWearTick = 0;
 
     // Console
     ConsolePicX = IfaceIni.GetInt( "ConsoleMainPicX", 0 );
@@ -2906,19 +2927,113 @@ void FOClient::IntDraw()
         DrawIndicator( IntWAmmoCount, IntAmmoPoints, COLOR_TEXT_GREEN, 0, IntAmmoTick, true, false );
     }
 
-    // Deteoration indicator
-    if( item->IsDeteriorable() )
+     // Deterioration indicator
+    if (item && item->IsDeteriorable()) 
     {
-        if( GameOpt.IndicatorType == INDICATOR_LINES || GameOpt.IndicatorType == INDICATOR_BOTH )
-            DrawIndicator( IntWWearProcent, IntWearPoints, COLOR_TEXT_RED, item->GetDeteriorationProc(), IntWearTick, true, false );
-        if( GameOpt.IndicatorType == INDICATOR_NUMBERS || GameOpt.IndicatorType == INDICATOR_BOTH )
-            SprMngr.DrawStr( Rect( IntWWearProcentStr, item_offsx, item_offsy ), Str::FormatBuf( "%d%%", item->GetDeteriorationProc() ), 0, IfaceHold == IFACE_INT_ITEM ? COLOR_TEXT_DRED : COLOR_TEXT_RED, FONT_SPECIAL );
-    }
-    else if( GameOpt.IndicatorType == INDICATOR_LINES || GameOpt.IndicatorType == INDICATOR_BOTH )
+    int deteriorationProc = item->GetDeteriorationProc();
+  
+    if (deteriorationProc > 0) 
     {
-        DrawIndicator( IntWWearProcent, IntWearPoints, COLOR_TEXT_RED, 0, IntWearTick, true, false );
+        if (GameOpt.IndicatorType == INDICATOR_LINES || GameOpt.IndicatorType == INDICATOR_BOTH) 
+        {
+            DrawIndicator(IntWWearProcent, IntWearPoints, COLOR_TEXT_GREEN, deteriorationProc, IntWearTick, true, false);
+        }
+        if (GameOpt.IndicatorType == INDICATOR_NUMBERS || GameOpt.IndicatorType == INDICATOR_BOTH) 
+        {
+            SprMngr.DrawStr(Rect(IntWWearProcentStr, item_offsx, item_offsy), Str::FormatBuf("%d%%", deteriorationProc), 0, IfaceHold == IFACE_INT_ITEM ? COLOR_TEXT_DGREEN : COLOR_TEXT, FONT_SPECIAL);
+        }
     }
 }
+
+    // Second slot on interface
+    int second_offsx = 0; 
+    int second_offsy = 0;
+
+    
+    if (Chosen->ItemSlotExt->GetId())
+    {
+    SprMngr.DrawSpriteSize(
+        ResMngr.GetInvAnim(Chosen->ItemSlotExt->GetPicInv()),
+        IntBSecond.L + second_offsx, IntBSecond.T + second_offsy,
+        (float)IntBSecond.W(), (float)IntBSecond.H(),
+        false, true, Chosen->ItemSlotExt->GetInvColor());
+    }
+
+    // Indicator
+    Item* second = Chosen->ItemSlotExt;
+    int indicatorsecond_max = second->Proto->IndicatorMax;
+	int indicatorsecond_cur = second->Data.Indicator;
+
+	if (second->IsWeapon() && second->WeapGetMaxAmmoCount())
+	{
+    indicatorsecond_max = second->WeapGetMaxAmmoCount();
+    indicatorsecond_cur = second->WeapGetAmmoCount();
+	}
+
+	if (indicatorsecond_max)
+	{
+    if (GameOpt.IndicatorType == INDICATOR_LINES || GameOpt.IndicatorType == INDICATOR_BOTH)
+        DrawIndicator(IntWSecondAmmoCount, IntSecondAmmoPoints, COLOR_TEXT_GREEN, Procent(indicatorsecond_max, indicatorsecond_cur), IntSecondAmmoTick, true, false);
+    
+    if (GameOpt.IndicatorType == INDICATOR_NUMBERS || GameOpt.IndicatorType == INDICATOR_BOTH)
+        SprMngr.DrawStr(Rect(IntWSecondAmmoCountStr, second_offsx, second_offsy), Str::FormatBuf("%03d", indicatorsecond_cur), 0, COLOR_TEXT, FONT_SPECIAL); 
+	}
+	else if (GameOpt.IndicatorType == INDICATOR_LINES || GameOpt.IndicatorType == INDICATOR_BOTH)
+	{
+    DrawIndicator(IntWSecondAmmoCount, IntSecondAmmoPoints, COLOR_TEXT_GREEN, 0, IntSecondAmmoTick, true, false);
+	}
+
+	if (second && second->IsDeteriorable()) 
+	{
+    int deteriorationSecondProc = second->GetDeteriorationProc();
+  
+    if (deteriorationSecondProc > 0) 
+    {
+        if (GameOpt.IndicatorType == INDICATOR_LINES || GameOpt.IndicatorType == INDICATOR_BOTH) 
+        {
+            DrawIndicator(IntWSecondWearProcent, IntSecondWearPoints, COLOR_TEXT_GREEN, deteriorationSecondProc, IntSecondWearTick, true, false);
+        }
+        if (GameOpt.IndicatorType == INDICATOR_NUMBERS || GameOpt.IndicatorType == INDICATOR_BOTH) 
+        {
+            SprMngr.DrawStr(Rect(IntWSecondWearProcentStr, second_offsx, second_offsy), Str::FormatBuf("%d%%", deteriorationSecondProc), 0, COLOR_TEXT, FONT_SPECIAL); 
+        }
+    }
+	}
+	
+	
+    // armor on interface
+	int armor_offsx = 0; 
+	int armor_offsy = 0;
+
+	if (Chosen->ItemSlotArmor->GetId())
+	{
+    SprMngr.DrawSpriteSize(
+        ResMngr.GetInvAnim(Chosen->ItemSlotArmor->GetPicInv()),
+        IntBArmor.L + armor_offsx, IntBArmor.T + armor_offsy,
+        (float)IntBArmor.W(), (float)IntBArmor.H(),
+        false, true, Chosen->ItemSlotArmor->GetInvColor());
+	}
+
+	Item* armor = Chosen->ItemSlotArmor;
+
+	if (armor && armor->IsDeteriorable()) 
+	{
+    int deteriorationProc = armor->GetDeteriorationProc();
+
+    if (deteriorationProc > 0) 
+    {
+        if (GameOpt.IndicatorType == INDICATOR_LINES || GameOpt.IndicatorType == INDICATOR_BOTH) 
+        {
+            DrawIndicator(IntWArmorWearProcent, IntArmorWearPoints, COLOR_TEXT_GREEN, deteriorationProc, IntArmorWearTick, true, false);
+        }
+        if (GameOpt.IndicatorType == INDICATOR_NUMBERS || GameOpt.IndicatorType == INDICATOR_BOTH) 
+        {
+            SprMngr.DrawStr(Rect(IntWArmorWearProcentStr, armor_offsx, armor_offsy), Str::FormatBuf("%d%%", deteriorationProc), 0, COLOR_TEXT, FONT_SPECIAL);
+        }
+    }
+	}
+	
+	}
 
 int FOClient::IntLMouseDown()
 {

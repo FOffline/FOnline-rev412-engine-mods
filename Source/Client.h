@@ -807,12 +807,18 @@ public:
     bool       IntVisible, IntAddMess;
     Rect       IntWMain, IntWAddMess, IntBAddMess, IntBMessFilter1, IntBMessFilter2, IntBMessFilter3;
     Rect       IntBItem, IntWApCost;
+	Rect       IntBSecond;
+    Rect       IntBArmor;
     Rect       IntBChangeSlot, IntBInv, IntBMenu, IntBSkill, IntBMap, IntBChar, IntBPip, IntBFix;
     Rect       IntWMess, IntWMessLarge;
     Rect       IntAP, IntHP, IntAC, IntBreakTime, IntAPText;
     int        IntAPstepX, IntAPstepY, IntAPMax;
     AnyFrames* IntBItemPicDn;
     int        IntBItemOffsX, IntBItemOffsY;
+	AnyFrames* IntBSecondPicDn;
+    int        IntBSecondOffsX, IntBSecondOffsY;
+	AnyFrames* IntBArmorPicDn;
+    int        IntBArmorOffsX, IntBArmorOffsY;
     AnyFrames* IntAimPic;
     int        IntAimX, IntAimY;
     int        IntUseX, IntUseY;
@@ -823,7 +829,13 @@ public:
     Rect       IntWAmmoCount, IntWWearProcent, IntWAmmoCountStr, IntWWearProcentStr;
     PointVec   IntAmmoPoints, IntWearPoints;
     uint       IntAmmoTick, IntWearTick;
-
+    Rect       IntWCombat, IntBCombatTurn, IntBCombatEnd;
+    Rect       IntWSecondAmmoCount, IntWSecondWearProcent, IntWSecondAmmoCountStr, IntWSecondWearProcentStr;
+    PointVec   IntSecondAmmoPoints, IntSecondWearPoints;
+    uint       IntSecondAmmoTick, IntSecondWearTick;	
+	Rect       IntWArmorWearProcent, IntWArmorWearProcentStr;
+    PointVec   IntArmorWearPoints;
+    uint       IntArmorWearTick;
     void IntDraw();
     int  IntLMouseDown();
     void IntRMouseDown();
