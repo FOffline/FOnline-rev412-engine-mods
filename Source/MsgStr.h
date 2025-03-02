@@ -5,7 +5,7 @@
 // ***  SYMBOLS  *************************************************************************
 // ***************************************************************************************
 
-#define TEXT_SYMBOL_DOT                    ( 149 )
+#define TEXT_SYMBOL_DOT                    ( 42 )
 #define TEXT_SYMBOL_CROSS                  ( 134 )
 #define TEXT_SYMBOL_TM                     ( 153 )
 #define TEXT_SYMBOL_EURO                   ( 163 )
