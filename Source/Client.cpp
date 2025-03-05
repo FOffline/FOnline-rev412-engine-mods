@@ -5512,7 +5512,7 @@ void FOClient::Net_OnChosenTalk()
         answers_texts.push_back( text_id );
     }
 
-    const char answ_beg[] = { ' ', ' ', (char) TEXT_SYMBOL_DOT, ' ', 0 };
+    const char answ_beg[] = { (char) ' ', 0 };
     const char page_up[] = { (char) TEXT_SYMBOL_UP, (char) TEXT_SYMBOL_UP, (char) TEXT_SYMBOL_UP, 0 };
     const int  page_up_height = SprMngr.GetLinesHeight( DlgAnswText.W(), 0, page_up );
     const char page_down[] = { (char) TEXT_SYMBOL_DOWN, (char) TEXT_SYMBOL_DOWN, (char) TEXT_SYMBOL_DOWN, 0 };

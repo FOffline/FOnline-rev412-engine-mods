@@ -1,7 +1,8 @@
 #include "StdAfx.h"
 #include "Client.h"
 #include "Version.h"
-
+#include <string>
+#include <sstream>
 // ==============================================================================================================================
 // ******************************************************************************************************************************
 // ==============================================================================================================================
@@ -3629,14 +3630,31 @@ void FOClient::DlgDraw( bool is_dialog )
         SprMngr.DrawStr( Rect( DlgWText, DlgX, DlgY ), DlgMainText.c_str(), FT_SKIPLINES( DlgMainTextCur ), COLOR_TEXT );
 
         // Answers
-        for( uint i = 0; i < DlgAnswers.size(); i++ )
-        {
-            Answer& a = DlgAnswers[ i ];
-            if( i == (uint) DlgCurAnsw )
-                SprMngr.DrawStr( Rect( a.Position, DlgX, DlgY ), DlgAnswers[ i ].Text.c_str(), a.AnswerNum < 0 ? FT_CENTERX : 0, IfaceHold == IFACE_DLG_ANSWER && DlgCurAnsw == DlgHoldAnsw ? COLOR_TEXT_DDGREEN : ( IfaceHold != IFACE_DLG_ANSWER ? COLOR_TEXT_DGREEN : COLOR_TEXT ) );
-            else
-                SprMngr.DrawStr( Rect( a.Position, DlgX, DlgY ), DlgAnswers[ i ].Text.c_str(), a.AnswerNum < 0 ? FT_CENTERX : 0, COLOR_TEXT );
-        }
+		for (uint i = 0; i < DlgAnswers.size(); i++)
+		{
+		Answer& a = DlgAnswers[i];
+    
+   
+		std::ostringstream oss;
+		oss << "[" << (i + 1) << "] " << a.Text;
+		std::string answerText = oss.str();
+
+		if (i == (uint)DlgCurAnsw)
+        SprMngr.DrawStr(
+            Rect(a.Position, DlgX, DlgY),
+            answerText.c_str(),
+            a.AnswerNum < 0 ? FT_CENTERX : 0,
+            IfaceHold == IFACE_DLG_ANSWER && DlgCurAnsw == DlgHoldAnsw ? COLOR_TEXT_DDGREEN : 
+            (IfaceHold != IFACE_DLG_ANSWER ? COLOR_TEXT_DGREEN : COLOR_TEXT)
+        );
+		else
+        SprMngr.DrawStr(
+            Rect(a.Position, DlgX, DlgY),
+            answerText.c_str(),
+            a.AnswerNum < 0 ? FT_CENTERX : 0,
+            COLOR_TEXT
+        );
+	}
 
         // Chosen money
         if( Chosen )
