@@ -6720,21 +6720,13 @@ void FOClient::GmapMouseMove()
 {
     if( IfaceHold == IFACE_GMAP_MOVE_MAP )
     {
-        if( GameOpt.MouseX < GmapWMap[ 0 ] )
-            GameOpt.MouseX = GmapWMap[ 0 ];
-        if( GameOpt.MouseY < GmapWMap[ 1 ] )
-            GameOpt.MouseY = GmapWMap[ 1 ];
-        if( GameOpt.MouseX > GmapWMap[ 2 ] )
-            GameOpt.MouseX = GmapWMap[ 2 ];
-        if( GameOpt.MouseY > GmapWMap[ 3 ] )
-            GameOpt.MouseY = GmapWMap[ 3 ];
-
-        SetCurPos( GameOpt.MouseX, GameOpt.MouseY );
-
         GmapOffsetX = GameOpt.MouseX - GmapVectX;
         GmapOffsetY = GameOpt.MouseY - GmapVectY;
 
         GMAP_CHECK_MAPSCR;
+		
+        GmapVectX = GameOpt.MouseX - GmapOffsetX;
+        GmapVectY = GameOpt.MouseY - GmapOffsetY;
     }
 }
 
