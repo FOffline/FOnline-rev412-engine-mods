@@ -727,6 +727,34 @@ bool Critter::IsItemVisible( Map* map, ushort hx, ushort hy, Item* item )
     return trace.IsFullTrace;
 }
 
+int Critter::GetLookAt( ushort hx, ushort hy )
+{
+    return GetLookAt( GetHexX(), GetHexY(), GetDir(), GetLook(), hx, hy );
+}
+
+int Critter::GetLookAt( ushort from_hx, ushort from_hy, ushort from_dir, int look_base, ushort target_hx, ushort target_hy )
+{
+    int look = look_base;
+
+    if( FLAG( GameOpt.LookChecks, LOOK_CHECK_DIR ) )
+    {
+        int real_dir = GetFarDir( from_hx, from_hy, target_hx, target_hy );
+        int dirs_count = DIRS_COUNT;
+
+        int i = ( from_dir > real_dir ? from_dir - real_dir : real_dir - from_dir );
+
+        if( i > dirs_count / 2 )
+            i = dirs_count - i;
+
+        look -= look * GameOpt.LookDir[ i ] / 100;
+    }
+
+    if( look < (int) GameOpt.LookMinimum )
+        look = GameOpt.LookMinimum;
+
+    return look;
+}
+
 void Critter::ProcessVisibleItems()
 {
     if( IsNotValid )
@@ -736,7 +764,6 @@ void Critter::ProcessVisibleItems()
     if( !map )
         return;
 
-    int        look = GetLook();
     ItemPtrVec items = map->GetItemsNoLock();
 
     for( auto it = items.begin(), end = items.end(); it != end; ++it )
@@ -780,7 +807,7 @@ void Critter::ProcessVisibleItems()
                 if( item->IsTrap() )
                     dist += item->TrapGetValue();
 
-                allowed = look >= dist;
+                allowed = GetLookAt( item->AccHex.HexX, item->AccHex.HexY ) >= dist;
             }
 
             // Check line of sight through walls/blockers.
@@ -940,7 +967,7 @@ void Critter::ViewMap( Map* map, int look, ushort hx, ushort hy, int dir )
 			if( item->IsTrap() )
 				dist += item->TrapGetValue();
 
-			allowed = look >= dist;
+			allowed = GetLookAt( hx, hy, dir, look, item->AccHex.HexX, item->AccHex.HexY ) >= dist;
 		}
 
 		// Check line of sight through walls/blockers.

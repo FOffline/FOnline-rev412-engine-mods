@@ -171,6 +171,8 @@ public:
     void SyncLockCritters( bool self_critters, bool only_players );
     void ProcessVisibleCritters();
     void ProcessVisibleItems();
+	int GetLookAt( ushort hx, ushort hy );
+	int GetLookAt( ushort from_hx, ushort from_hy, ushort from_dir, int look_base, ushort target_hx, ushort target_hy );
     void ViewMap( Map* map, int look, ushort hx, ushort hy, int dir );
 	bool IsItemVisible( Map* map, ushort hx, ushort hy, Item* item );
     void ClearVisible();
