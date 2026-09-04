@@ -702,6 +702,31 @@ void Critter::ProcessVisibleCritters()
     }
 }
 
+bool Critter::IsItemVisible( Map* map, ushort hx, ushort hy, Item* item )
+{
+    if( !map || !item )
+        return false;
+
+    // Items on the same hex are always visible.
+    if( hx == item->AccHex.HexX && hy == item->AccHex.HexY )
+        return true;
+
+    // Use the same trace system as normal critter visibility.
+    if( !FLAG( GameOpt.LookChecks, LOOK_CHECK_TRACE ) )
+        return true;
+
+    TraceData trace;
+    trace.TraceMap = map;
+    trace.BeginHx = hx;
+    trace.BeginHy = hy;
+    trace.EndHx = item->AccHex.HexX;
+    trace.EndHy = item->AccHex.HexY;
+
+    MapMngr.TraceBullet( trace );
+
+    return trace.IsFullTrace;
+}
+
 void Critter::ProcessVisibleItems()
 {
     if( IsNotValid )
@@ -713,13 +738,16 @@ void Critter::ProcessVisibleItems()
 
     int        look = GetLook();
     ItemPtrVec items = map->GetItemsNoLock();
+
     for( auto it = items.begin(), end = items.end(); it != end; ++it )
     {
         Item* item = *it;
 
         if( item->IsHidden() )
             continue;
-        else if( item->IsAlwaysView() )
+
+        // Always visible items ignore distance and LOS.
+        if( item->IsAlwaysView() )
         {
             if( AddIdVisItem( item->GetId() ) )
             {
@@ -730,6 +758,8 @@ void Critter::ProcessVisibleItems()
         else
         {
             bool allowed = false;
+
+            // Existing trap visibility check.
             if( item->IsTrap() && FLAG( GameOpt.LookChecks, LOOK_CHECK_ITEM_SCRIPT ) )
             {
                 if( Script::PrepareContext( ServerFunctions.CheckTrapLook, _FUNC_, GetInfo() ) )
@@ -737,16 +767,27 @@ void Critter::ProcessVisibleItems()
                     Script::SetArgObject( map );
                     Script::SetArgObject( this );
                     Script::SetArgObject( item );
+
                     if( Script::RunPrepared() )
                         allowed = Script::GetReturnedBool();
                 }
             }
             else
             {
-                int dist = DistGame( Data.HexX, Data.HexY, item->AccHex.HexX, item->AccHex.HexY );
+                int dist = DistGame( Data.HexX, Data.HexY,
+                                     item->AccHex.HexX, item->AccHex.HexY );
+
                 if( item->IsTrap() )
                     dist += item->TrapGetValue();
+
                 allowed = look >= dist;
+            }
+
+            // Check line of sight through walls/blockers.
+            if( allowed )
+            {
+                if( !IsItemVisible( map, Data.HexX, Data.HexY, item ) )
+                    allowed = false;
             }
 
             if( allowed )
@@ -860,43 +901,58 @@ void Critter::ViewMap( Map* map, int look, ushort hx, ushort hy, int dir )
             Send_AddCritter( cr );
     }
 
-    // Items
-    ItemPtrVec& items = map->GetItemsNoLock();
-    for( auto it = items.begin(), end = items.end(); it != end; ++it )
-    {
-        Item* item = *it;
+   // Items
+	ItemPtrVec& items = map->GetItemsNoLock();
 
-        if( item->IsHidden() )
-            continue;
-        else if( item->IsAlwaysView() )
-            Send_AddItemOnMap( item );
-        else
-        {
-            bool allowed = false;
-            if( item->IsTrap() && FLAG( GameOpt.LookChecks, LOOK_CHECK_ITEM_SCRIPT ) )
-            {
-                if( Script::PrepareContext( ServerFunctions.CheckTrapLook, _FUNC_, GetInfo() ) )
-                {
-                    Script::SetArgObject( map );
-                    Script::SetArgObject( this );
-                    Script::SetArgObject( item );
-                    if( Script::RunPrepared() )
-                        allowed = Script::GetReturnedBool();
-                }
-            }
-            else
-            {
-                int dist = DistGame( hx, hy, item->AccHex.HexX, item->AccHex.HexY );
-                if( item->IsTrap() )
-                    dist += item->TrapGetValue();
-                allowed = look >= dist;
-            }
+	for( auto it = items.begin(), end = items.end(); it != end; ++it )
+	{
+		Item* item = *it;
 
+		if( item->IsHidden() )
+			continue;
 
-            if( allowed )
-                Send_AddItemOnMap( item );
-        }
-    }
+		// Always visible items ignore distance and LOS.
+		if( item->IsAlwaysView() )
+		{
+			Send_AddItemOnMap( item );
+			continue;
+		}
+
+		bool allowed = false;
+
+		if( item->IsTrap() && FLAG( GameOpt.LookChecks, LOOK_CHECK_ITEM_SCRIPT ) )
+		{
+			if( Script::PrepareContext( ServerFunctions.CheckTrapLook, _FUNC_, GetInfo() ) )
+			{
+				Script::SetArgObject( map );
+				Script::SetArgObject( this );
+				Script::SetArgObject( item );
+
+				if( Script::RunPrepared() )
+					allowed = Script::GetReturnedBool();
+			}
+		}
+		else
+		{
+			int dist = DistGame( hx, hy,
+								 item->AccHex.HexX, item->AccHex.HexY );
+
+			if( item->IsTrap() )
+				dist += item->TrapGetValue();
+
+			allowed = look >= dist;
+		}
+
+		// Check line of sight through walls/blockers.
+		if( allowed )
+		{
+			if( !IsItemVisible( map, hx, hy, item ) )
+				allowed = false;
+		}
+
+		if( allowed )
+			Send_AddItemOnMap( item );
+	}
 }
 
 void Critter::ClearVisible()

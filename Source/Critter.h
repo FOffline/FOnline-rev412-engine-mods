@@ -172,6 +172,7 @@ public:
     void ProcessVisibleCritters();
     void ProcessVisibleItems();
     void ViewMap( Map* map, int look, ushort hx, ushort hy, int dir );
+	bool IsItemVisible( Map* map, ushort hx, ushort hy, Item* item );
     void ClearVisible();
 
     Critter* GetCritSelf( uint crid, bool sync_lock );

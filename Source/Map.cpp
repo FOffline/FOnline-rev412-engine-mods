@@ -676,9 +676,12 @@ bool Map::AddItem( Item* item, ushort hx, ushort hy )
                     continue;
             }
 
-            cr->AddIdVisItem( item->GetId() );
-            cr->Send_AddItemOnMap( item );
-            cr->EventShowItemOnMap( item, false, NULL );
+            if( item->IsAlwaysView() || cr->IsItemVisible( this, cr->GetHexX(), cr->GetHexY(), item ) )
+			{
+				cr->AddIdVisItem( item->GetId() );
+				cr->Send_AddItemOnMap( item );
+				cr->EventShowItemOnMap( item, false, NULL );
+			}
         }
     }
     item->ViewPlaceOnMap = false;
@@ -825,12 +828,15 @@ void Map::ChangeViewItem( Item* item )
                         dist += item->TrapGetValue();
                     allowed = dist <= cr->GetLook();
                 }
-                if( !allowed )
-                {
-                    cr->DelIdVisItem( item->GetId() );
-                    cr->Send_EraseItemFromMap( item );
-                    cr->EventHideItemOnMap( item, false, NULL );
-                }
+                if( allowed && !cr->IsItemVisible( this, cr->GetHexX(), cr->GetHexY(), item ) )
+					allowed = false;
+
+				if( !allowed )
+				{
+					cr->DelIdVisItem( item->GetId() );
+					cr->Send_EraseItemFromMap( item );
+					cr->EventHideItemOnMap( item, false, NULL );
+				}
             }
         }
         else if( !item->IsHidden() || item->IsAlwaysView() )
@@ -857,7 +863,10 @@ void Map::ChangeViewItem( Item* item )
                     allowed = dist <= cr->GetLook();
                 }
                 if( !allowed )
-                    continue;
+				continue;
+
+			if( !cr->IsItemVisible( this, cr->GetHexX(), cr->GetHexY(), item ) )
+				continue;
             }
 
             cr->AddIdVisItem( item->GetId() );
