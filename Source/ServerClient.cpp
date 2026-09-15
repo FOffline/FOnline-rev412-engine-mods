@@ -4200,7 +4200,23 @@ void FOServer::Process_Combat( Client* cl )
             return;
         }
         if( map->IsTurnBasedOn && map->IsCritterTurn( cl ) )
-            map->EndCritterTurn();
+        {
+            // Explicit "end my turn now" request from the End Turn
+            // button -- unlike EndCritterTurn's AP-based inference
+            // (meant for "did I just naturally run out"), this is an
+            // unambiguous player intent and should force the phase to
+            // end immediately, regardless of remaining AP. The SPACE-key
+            // path (client_main.fos -> unsafe_EndTurnBasedTurn) reaches
+            // the same result indirectly, by zeroing the player's AP
+            // first so the normal exhaustion check catches it naturally
+            // on the next tick; this button path never zeroed anything,
+            // so it fell through both the exhaustion check (AP still
+            // > 0) and the stagnation check (deliberately disabled for
+            // the player's own phase, so a human pausing to think isn't
+            // mistaken for being done) -- leaving the phase stuck open
+            // until the raw safety-net timeout.
+            map->TurnBasedEndTick = Timer::GameTick();
+        }
     }
     else if( type == COMBAT_TB_END_COMBAT )
     {

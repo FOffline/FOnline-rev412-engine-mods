@@ -213,6 +213,19 @@ public:
     uint    TurnBasedTurn;
     uint    TurnBasedWholeTurn;
 
+    // Two-block turn model: whichever category (player or NPC) sits
+    // first in TurnSequence (i.e. has the highest Sequence overall) acts
+    // first each round, as a whole block, simultaneously among its own
+    // members -- the other category is fully frozen until the active
+    // block exhausts its AP, then the blocks swap. The tracking state
+    // this needs (which category is active, plus stagnation-detection
+    // bookkeeping) is NOT stored here as member fields -- it lives in a
+    // static, map-id-keyed table inside Map.cpp instead (TurnPhaseState/
+    // GetTurnPhaseState), so Map's own memory layout/sizeof is completely
+    // unaffected and the existing STATIC_ASSERT(OFFSETOF(Map, ...))
+    // checks in Server.cpp never need touching. See BeginTurnPhase/
+    // EndTurnPhase/IsTurnPhaseExhausted/IsTurnPhaseStagnant in Map.cpp.
+
     void BeginTurnBased( Critter* first_cr );
     void EndTurnBased();
     bool TryEndTurnBased();
@@ -223,6 +236,11 @@ public:
     void EndCritterTurn();
     void NextCritterTurn();
     void GenerateSequence( Critter* first_cr );
+    void BeginTurnPhase();
+    void EndTurnPhase();
+    bool IsTurnPhaseExhausted();
+    bool IsTurnPhaseStagnant();
+    int  GetTurnPhaseApSum();
 
     // Constructor, destructor
 public:

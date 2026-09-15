@@ -1974,10 +1974,30 @@ void Map::SetTextMsgLex( ushort hx, ushort hy, uint color, ushort text_msg, uint
     }
 }
 
+// Per-round turn-phase bookkeeping for the two-block simultaneous model,
+// keyed by map id, kept OUTSIDE the Map class entirely (not new member
+// fields) so Map's own memory layout/sizeof is completely unaffected --
+// avoids having to touch the STATIC_ASSERT(OFFSETOF(Map, ...)) checks in
+// Server.cpp that pin down every existing Map member's byte offset.
+struct TurnPhaseState
+{
+    bool TurnPhaseIsNpc;
+    int  ApSum;
+    uint ActivityTick;
+    TurnPhaseState(): TurnPhaseIsNpc( false ), ApSum( 0 ), ActivityTick( 0 ) {}
+};
+static map< uint, TurnPhaseState > TurnPhaseStates;
+static TurnPhaseState& GetTurnPhaseState( uint map_id )
+{
+    return TurnPhaseStates[ map_id ];
+}
+
 void Map::BeginTurnBased( Critter* first_cr )
 {
     if( IsTurnBasedOn )
         return;
+
+    
 
     IsTurnBasedOn = true;
     NeedEndTurnBased = false;
@@ -1987,6 +2007,8 @@ void Map::BeginTurnBased( Critter* first_cr )
     TurnBasedBeginSecond = GameOpt.FullSecond;
 
     GenerateSequence( first_cr );
+    TurnSequenceCur = -1;
+    IsTurnBasedTimeout = false;
 
     CrVec critters;
     GetCritters( critters, true );
@@ -1997,14 +2019,6 @@ void Map::BeginTurnBased( Critter* first_cr )
         cr->ChangeParam( ST_MOVE_AP );
         cr->ChangeParam( MODE_END_COMBAT );
         cr->ChangeParam( ST_TURN_BASED_AC );
-        if( !first_cr || cr != first_cr )
-        {
-            if( cr->Data.Params[ ST_CURRENT_AP ] > 0 )
-                cr->Data.Params[ ST_CURRENT_AP ] = 0;
-            else
-                cr->Data.Params[ ST_CURRENT_AP ] = cr->Data.Params[ ST_CURRENT_AP ] / AP_DIVIDER * AP_DIVIDER;
-        }
-
         cr->Data.Params[ ST_MOVE_AP ] = 0;
         cr->Data.Params[ MODE_END_COMBAT ] = 0;
         cr->Data.Params[ ST_TURN_BASED_AC ] = 0;
@@ -2012,8 +2026,20 @@ void Map::BeginTurnBased( Critter* first_cr )
         cr->SetTimeout( TO_BATTLE, TB_BATTLE_TIMEOUT );
         cr->SetTimeout( TO_TRANSFER, 0 );
     }
-    TurnSequenceCur = -1;
-    IsTurnBasedTimeout = false;
+
+    TurnPhaseState& tps = GetTurnPhaseState( GetId() );
+
+    // Two-block model: whichever category sits first in the freshly
+    // generated TurnSequence acts first this round.
+    if( !TurnSequence.empty() )
+    {
+        Critter* starter = GetCritter( TurnSequence[ 0 ], true );
+        tps.TurnPhaseIsNpc = ( starter && starter->IsNpc() );
+    }
+    else
+    {
+        tps.TurnPhaseIsNpc = false;
+    }
 
     EventTurnBasedBegin();
     if( Script::PrepareContext( ServerFunctions.TurnBasedBegin, _FUNC_, Str::FormatBuf( "Map id<%u>, pid<%u>", GetId(), GetPid() ) ) )
@@ -2023,9 +2049,12 @@ void Map::BeginTurnBased( Critter* first_cr )
     }
 
     if( NeedEndTurnBased || TurnSequence.empty() )
+    {
         EndTurnBased();
-    else
-        NextCritterTurn();
+        return;
+    }
+
+    BeginTurnPhase();
 }
 
 void Map::EndTurnBased()
@@ -2044,6 +2073,13 @@ void Map::EndTurnBased()
     TurnSequenceCur = -1;
     IsTurnBasedTimeout = false;
 
+    // Combat over -- drop this map's phase-tracking entry (harmless
+    // no-op in legacy mode, since it's never populated there) so a later
+    // fight (or, if map ids ever get reused, a completely different map
+    // instance) starts from a clean slate instead of inheriting stale
+    // state.
+    TurnPhaseStates.erase( GetId() );
+
     CrVec critters;
     GetCritters( critters, true );
     for( auto it = critters.begin(), end = critters.end(); it != end; ++it )
@@ -2060,13 +2096,211 @@ void Map::EndTurnBased()
     }
 }
 
+// Grants AP (debt-aware, matching the original per-critter behaviour) and
+// fires the per-critter turn_based_process(true) hook for every living
+// member of the block that TurnPhaseIsNpc currently points at.
+void Map::BeginTurnPhase()
+{
+    TurnPhaseState& tps = GetTurnPhaseState( GetId() );
+
+    // Only critters actually part of this fight (TurnSequence), not every
+    // NPC on the map -- an unrelated, idle NPC elsewhere would otherwise
+    // get full AP it never spends, which stalls IsTurnPhaseExhausted()
+    // and forces every phase to end via the GameOpt.TurnBasedTick timeout
+    // instead of real AP exhaustion, cutting the actually-engaged NPCs
+    // off mid-movement.
+    uint phase_member_count = 0;
+    for( auto it = TurnSequence.begin(), end = TurnSequence.end(); it != end; ++it )
+    {
+        Critter* cr = GetCritter( *it, true );
+        if( !cr )
+            continue;
+        if( cr->IsNpc() != tps.TurnPhaseIsNpc )
+            continue;
+        if( cr->IsDead() )
+            continue;
+
+        // AP is granted to every NPC in this fight regardless of
+        // engagement (an idle one might pick up a target mid-round and
+        // will need it then) -- but phase_member_count, which only
+        // scales the safety-net timeout, should reflect genuinely active
+        // participants so it isn't inflated by NPCs that will never
+        // spend anything. cr is already known to match tps.TurnPhaseIsNpc's
+        // category here, so "not an NPC" means "is the player".
+        if( !cr->IsNpc() || static_cast< Npc* >( cr )->HasCombatTarget() )
+            phase_member_count++;
+
+        cr->ChangeParam( ST_CURRENT_AP );
+        if( cr->Data.Params[ ST_CURRENT_AP ] >= 0 )
+            cr->Data.Params[ ST_CURRENT_AP ] = cr->GetParam( ST_ACTION_POINTS ) * AP_DIVIDER;
+        else
+            cr->Data.Params[ ST_CURRENT_AP ] += cr->GetParam( ST_ACTION_POINTS ) * AP_DIVIDER;
+
+        if( cr->IsKnockout() )
+            cr->TryUpOnKnockout();
+
+        cr->Send_ParamOther( OTHER_YOU_TURN, GameOpt.TurnBasedTick );
+        cr->SendA_ParamOther( OTHER_YOU_TURN, GameOpt.TurnBasedTick );
+
+        cr->EventTurnBasedProcess( this, true );
+        EventTurnBasedProcess( cr, true );
+        if( Script::PrepareContext( ServerFunctions.TurnBasedProcess, _FUNC_, cr->GetInfo() ) )
+        {
+            Script::SetArgObject( this );
+            Script::SetArgObject( cr );
+            Script::SetArgBool( true );
+            Script::RunPrepared();
+        }
+    }
+
+    // GameOpt.TurnBasedTick is sized for ONE critter's own, fully isolated
+    // turn (the original per-critter model). Here, every member of this
+    // block shares that same single window -- an idle member (no target
+    // yet, so it will never spend its AP) doesn't just waste its own
+    // time like in the original, it eats into the shared time budget the
+    // genuinely active members need to actually use their AP. Scaling
+    // the window by the block's size keeps active members from being cut
+    // off early just because other members of their own group haven't
+    // engaged yet.
+    if( phase_member_count == 0 )
+        phase_member_count = 1;
+    TurnBasedEndTick = Timer::GameTick() + GameOpt.TurnBasedTick * phase_member_count;
+    IsTurnBasedTimeout = false;
+
+    // Reset stagnation tracking for this fresh phase.
+    tps.ApSum = GetTurnPhaseApSum();
+    tps.ActivityTick = Timer::GameTick();
+
+    WriteLog( "TB DEBUG: BeginTurnPhase map<%u> IsNpcPhase<%d> members<%u> TurnBasedTick<%u> windowMs<%u> initialApSum<%d>\n",
+              GetId(), tps.TurnPhaseIsNpc ? 1 : 0, phase_member_count, GameOpt.TurnBasedTick, GameOpt.TurnBasedTick * phase_member_count, tps.ApSum );
+}
+
+// Fires the per-critter turn_based_process(false) hook for every member
+// of the currently active block. Leftover AP is intentionally left as-is
+// (not zeroed) so debt/surplus carries correctly into that critter's next
+// phase, exactly like the original per-critter model already did.
+// Simultaneous model only -- legacy mode never calls this.
+void Map::EndTurnPhase()
+{
+    TurnPhaseState& tps = GetTurnPhaseState( GetId() );
+
+    // Same scoping fix as BeginTurnPhase -- only fire this for critters
+    // actually in this fight's TurnSequence.
+    for( auto it = TurnSequence.begin(), end = TurnSequence.end(); it != end; ++it )
+    {
+        Critter* cr = GetCritter( *it, true );
+        if( !cr )
+            continue;
+        if( cr->IsNpc() != tps.TurnPhaseIsNpc )
+            continue;
+
+        // Force an authoritative position resync the instant this
+        // critter's phase ends. A critter can be frozen mid-walk-
+        // animation here (the whole block's AP/timer ran out, not
+        // necessarily in step with any individual member's own motion),
+        // and Act_Move stops being callable for it the moment CheckMyTurn
+        // flips -- without this, observers keep whatever position they
+        // last rendered client-side (which can be a hex or two ahead of
+        // the server's real HexX/HexY) until some unrelated later packet
+        // happens to carry the correction.
+        cr->SendA_XY();
+
+        cr->EventTurnBasedProcess( this, false );
+        EventTurnBasedProcess( cr, false );
+        if( Script::PrepareContext( ServerFunctions.TurnBasedProcess, _FUNC_, cr->GetInfo() ) )
+        {
+            Script::SetArgObject( this );
+            Script::SetArgObject( cr );
+            Script::SetArgBool( false );
+            Script::RunPrepared();
+        }
+    }
+}
+
+// True once every living, genuinely-engaged member of the currently
+// active block has exhausted its AP. Simultaneous model only.
+bool Map::IsTurnPhaseExhausted()
+{
+    TurnPhaseState& tps = GetTurnPhaseState( GetId() );
+
+    // Same scoping fix as BeginTurnPhase/EndTurnPhase -- only critters
+    // actually in this fight's TurnSequence count towards exhaustion.
+    for( auto it = TurnSequence.begin(), end = TurnSequence.end(); it != end; ++it )
+    {
+        Critter* cr = GetCritter( *it, true );
+        if( !cr )
+            continue;
+        if( cr->IsNpc() != tps.TurnPhaseIsNpc )
+            continue;
+        if( cr->IsDead() )
+            continue;
+
+        // An NPC with no live combat target (no attack plane yet, or its
+        // target died/vanished) will sit on its full, untouched AP
+        // forever -- it isn't "still acting", it has nothing to act on.
+        // Don't let it block the rest of the block from being detected
+        // as done.
+        if( cr->IsNpc() && !static_cast< Npc* >( cr )->HasCombatTarget() )
+            continue;
+
+        if( cr->GetAllAp() > 0 )
+            return false;
+    }
+    WriteLog( "TB DEBUG: IsTurnPhaseExhausted map<%u> IsNpcPhase<%d> -> TRUE (everyone in TurnSequence for this phase is at 0 AP or dead)\n",
+              GetId(), tps.TurnPhaseIsNpc ? 1 : 0 );
+    return true;
+}
+
+// Simultaneous model only.
+int Map::GetTurnPhaseApSum()
+{
+    TurnPhaseState& tps = GetTurnPhaseState( GetId() );
+
+    int sum = 0;
+    for( auto it = TurnSequence.begin(), end = TurnSequence.end(); it != end; ++it )
+    {
+        Critter* cr = GetCritter( *it, true );
+        if( !cr )
+            continue;
+        if( cr->IsNpc() != tps.TurnPhaseIsNpc )
+            continue;
+        if( cr->IsDead() )
+            continue;
+        if( cr->IsNpc() && !static_cast< Npc* >( cr )->HasCombatTarget() )
+            continue;
+        sum += cr->GetAllAp();
+    }
+    return sum;
+}
+
+// True once the active block has gone quiet for TURN_PHASE_STAGNANT_MS.
+// Simultaneous model only.
+bool Map::IsTurnPhaseStagnant()
+{
+    #define TURN_PHASE_STAGNANT_MS    ( 1500 )
+
+    TurnPhaseState& tps = GetTurnPhaseState( GetId() );
+
+    int sum = GetTurnPhaseApSum();
+    if( sum != tps.ApSum )
+    {
+        tps.ApSum = sum;
+        tps.ActivityTick = Timer::GameTick();
+        return false;
+    }
+    return ( Timer::GameTick() - tps.ActivityTick >= TURN_PHASE_STAGNANT_MS );
+}
+
 void Map::ProcessTurnBased()
 {
+   
+
     if( !IsTurnBasedTimeout )
     {
-        Critter* cr = GetCritter( GetCritterTurnId(), true );
-        if( !cr || ( cr->IsDead() || cr->GetAllAp() <= 0 || cr->GetParam( ST_CURRENT_HP ) <= 0 ) )
-            EndCritterTurn();
+        // Polled every tick (not just reactively from an individual
+        // critter's own AP check) so IsTurnPhaseStagnant's activity
+        // timer is measured accurately.
+        EndCritterTurn();
     }
 
     if( Timer::GameTick() >= TurnBasedEndTick )
@@ -2081,16 +2315,27 @@ void Map::ProcessTurnBased()
 
 bool Map::IsCritterTurn( Critter* cr )
 {
-    if( TurnSequenceCur >= (int) TurnSequence.size() )
-        return false;
-    return TurnSequence[ TurnSequenceCur ] == cr->GetId();
+   
+
+    return cr->IsNpc() == GetTurnPhaseState( GetId() ).TurnPhaseIsNpc;
 }
 
 uint Map::GetCritterTurnId()
 {
-    if( TurnSequenceCur >= (int) TurnSequence.size() )
-        return 0;
-    return TurnSequence[ TurnSequenceCur ];
+   
+
+    TurnPhaseState& tps = GetTurnPhaseState( GetId() );
+
+    // Best-effort single-critter id for UI/reporting: the first living
+    // member of the currently active block that's actually part of this
+    // fight (TurnSequence), or 0 if none.
+    for( auto it = TurnSequence.begin(), end = TurnSequence.end(); it != end; ++it )
+    {
+        Critter* cr = GetCritter( *it, true );
+        if( cr && cr->IsNpc() == tps.TurnPhaseIsNpc && !cr->IsDead() )
+            return cr->GetId();
+    }
+    return 0;
 }
 
 uint Map::GetCritterTurnTime()
@@ -2101,126 +2346,88 @@ uint Map::GetCritterTurnTime()
 
 void Map::EndCritterTurn()
 {
-    TurnBasedEndTick = Timer::GameTick();
+   
+
+    // Called unconditionally from CHECK_NPC_AP-style macros in
+    // ServerNpc.cpp/ServerClient.cpp whenever a SINGLE critter's own AP
+    // runs out -- exactly as in the original per-critter model, where
+    // that always meant "this was the only one acting, so the turn is
+    // over." Under the two-block model it no longer does: it might just
+    // be the first of several members sharing this phase to run dry.
+    // End the phase once every member of the active block is genuinely
+    // exhausted, OR -- NPC phase only -- once the block has gone quiet
+    // for a few seconds (IsTurnPhaseStagnant, catches an idle NPC with
+    // nothing to do that would otherwise sit on unspent AP forever and
+    // block true exhaustion from ever triggering). Stagnation must NOT
+    // apply to the player's own phase: a human pausing to think or aim
+    // for more than a few seconds is not "done", unlike an NPC whose AI
+    // acts every tick on its own. The player's phase only ends via real
+    // AP exhaustion, an explicit End Turn click (which forces
+    // TurnBasedEndTick directly, bypassing this function), or the
+    // block-size-scaled safety-net timeout from BeginTurnPhase.
+    TurnPhaseState& tps = GetTurnPhaseState( GetId() );
+    bool            should_end = IsTurnPhaseExhausted();
+    if( !should_end && tps.TurnPhaseIsNpc )
+        should_end = IsTurnPhaseStagnant();
+
+    if( should_end )
+    {
+        WriteLog( "TB DEBUG: EndCritterTurn map<%u> IsNpcPhase<%d> forcing phase end\n", GetId(), tps.TurnPhaseIsNpc ? 1 : 0 );
+        TurnBasedEndTick = Timer::GameTick();
+    }
 }
 
+// Advances from the block that just finished acting to the next one --
+// the other block if this was the round's first phase, or a whole new
+// round (fresh TurnSequence, fresh starting block) if this was the
+// second. 
 void Map::NextCritterTurn()
 {
-    // End previous turn
-    if( TurnSequenceCur >= 0 )
-    {
-        Critter* cr = GetCritter( TurnSequence[ TurnSequenceCur ], true );
-        if( cr )
-        {
-            cr->EventTurnBasedProcess( this, false );
-            EventTurnBasedProcess( cr, false );
-            if( Script::PrepareContext( ServerFunctions.TurnBasedProcess, _FUNC_, cr->GetInfo() ) )
-            {
-                Script::SetArgObject( this );
-                Script::SetArgObject( cr );
-                Script::SetArgBool( false );
-                Script::RunPrepared();
-            }
+    
 
-            if( cr->Data.Params[ ST_CURRENT_AP ] > 0 )
-            {
-                cr->ChangeParam( ST_CURRENT_AP );
-                cr->Data.Params[ ST_CURRENT_AP ] = 0;
-            }
-        }
-        else
-        {
-            TurnSequence.erase( TurnSequence.begin() + TurnSequenceCur );
-            TurnSequenceCur--;
-        }
+    TurnPhaseState& tps = GetTurnPhaseState( GetId() );
+    EndTurnPhase();
+
+    bool starter_is_npc = false;
+    if( !TurnSequence.empty() )
+    {
+        Critter* starter = GetCritter( TurnSequence[ 0 ], true );
+        starter_is_npc = ( starter && starter->IsNpc() );
     }
 
-    // Begin next
-    TurnSequenceCur++;
-    if( TurnSequenceCur >= (int) TurnSequence.size() ) // Next round
+    if( tps.TurnPhaseIsNpc == starter_is_npc )
     {
-        // Next turn
-        GenerateSequence( NULL );
-        TurnSequenceCur = -1;
-        TurnBasedRound++;
-        TurnBasedTurn = 0;
-
-        EventTurnBasedBegin();
-        if( Script::PrepareContext( ServerFunctions.TurnBasedBegin, _FUNC_, Str::FormatBuf( "Map id<%u>, pid<%u>", GetId(), GetPid() ) ) )
-        {
-            Script::SetArgObject( this );
-            Script::RunPrepared();
-        }
-
-        if( NeedEndTurnBased || TurnSequence.empty() )
-            EndTurnBased();
-        else
-            NextCritterTurn();
+        // The block that just ended was this round's first phase --
+        // switch to the other block for the second phase.
+        tps.TurnPhaseIsNpc = !tps.TurnPhaseIsNpc;
+        TurnBasedTurn++;
+        TurnBasedWholeTurn++;
+        BeginTurnPhase();
+        return;
     }
-    else     // Next critter turn
+
+    // The block that just ended was this round's second phase -- the
+    // round is complete.
+    GenerateSequence( NULL );
+    TurnBasedRound++;
+    TurnBasedTurn = 0;
+
+    EventTurnBasedBegin();
+    if( Script::PrepareContext( ServerFunctions.TurnBasedBegin, _FUNC_, Str::FormatBuf( "Map id<%u>, pid<%u>", GetId(), GetPid() ) ) )
     {
-        Critter* cr = GetCritter( TurnSequence[ TurnSequenceCur ], true );
-        if( !cr || cr->IsDead() )
-        {
-            TurnSequence.erase( TurnSequence.begin() + TurnSequenceCur );
-            TurnSequenceCur--;
-            TurnBasedTurn++;
-            TurnBasedWholeTurn++;
-            NextCritterTurn();
-            return;
-        }
-
-        if( cr->Data.Params[ ST_CURRENT_AP ] >= 0 )
-        {
-            cr->ChangeParam( ST_CURRENT_AP );
-            cr->Data.Params[ ST_CURRENT_AP ] = cr->GetParam( ST_ACTION_POINTS ) * AP_DIVIDER;
-        }
-        else
-        {
-            cr->ChangeParam( ST_CURRENT_AP );
-            cr->Data.Params[ ST_CURRENT_AP ] += cr->GetParam( ST_ACTION_POINTS ) * AP_DIVIDER;
-            if( cr->GetParam( ST_CURRENT_AP ) < 0 || ( cr->GetParam( ST_CURRENT_AP ) == 0 && !cr->GetParam( ST_MAX_MOVE_AP ) ) )
-            {
-                TurnBasedTurn++;
-                TurnBasedWholeTurn++;
-                NextCritterTurn();
-                return;
-            }
-        }
-
-        if( cr->IsKnockout() )
-        {
-            cr->TryUpOnKnockout();
-            if( cr->IsKnockout() )
-            {
-                TurnBasedTurn++;
-                TurnBasedWholeTurn++;
-                NextCritterTurn();
-                return;
-            }
-        }
-
-        cr->Send_ParamOther( OTHER_YOU_TURN, GameOpt.TurnBasedTick );
-        cr->SendA_ParamOther( OTHER_YOU_TURN, GameOpt.TurnBasedTick );
-        TurnBasedEndTick = Timer::GameTick() + GameOpt.TurnBasedTick;
-
-        cr->EventTurnBasedProcess( this, true );
-        EventTurnBasedProcess( cr, true );
-        if( Script::PrepareContext( ServerFunctions.TurnBasedProcess, _FUNC_, cr->GetInfo() ) )
-        {
-            Script::SetArgObject( this );
-            Script::SetArgObject( cr );
-            Script::SetArgBool( true );
-            Script::RunPrepared();
-        }
-        if( NeedEndTurnBased )
-            EndTurnBased();
-        else
-        {
-            TurnBasedTurn++;
-            TurnBasedWholeTurn++;
-        }
+        Script::SetArgObject( this );
+        Script::RunPrepared();
     }
+
+    if( NeedEndTurnBased || TurnSequence.empty() )
+    {
+        EndTurnBased();
+        return;
+    }
+
+    Critter* new_starter = GetCritter( TurnSequence[ 0 ], true );
+    tps.TurnPhaseIsNpc = ( new_starter && new_starter->IsNpc() );
+    BeginTurnPhase();
 }
 
 void Map::GenerateSequence( Critter* first_cr )

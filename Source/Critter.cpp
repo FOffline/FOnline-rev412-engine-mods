@@ -5896,3 +5896,19 @@ void Npc::SetTarget( int reason, Critter* target, int min_hp, bool is_gag )
     plane->Attack.IsRun = ( IsTurnBased() ? GameOpt.TbAlwaysRun : GameOpt.RtAlwaysRun );
     AddPlane( reason, plane, false, target, NULL );
 }
+
+bool Npc::HasCombatTarget()
+{
+    // GetCurPlane() already resolves the actual currently-active plane
+    // (a plane can have child planes; GetCurPlane() walks to the
+    // innermost one), matching exactly what ProcessAI/RunPlane act on --
+    // so this checks the same thing the AI loop itself is driven by,
+    // rather than re-walking aiPlanes independently and risking missing
+    // an attack plane nested under something else.
+    AIDataPlane* plane = GetCurPlane();
+    if( !plane || plane->Type != AI_PLANE_ATTACK || !plane->Attack.TargId )
+        return false;
+
+    Critter* target = GetCritSelf( plane->Attack.TargId, true );
+    return ( target && !target->IsDead() );
+}

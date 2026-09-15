@@ -800,6 +800,12 @@ public:
         AIDataPlane* p = GetCurPlane();
         return p ? p->Type == plane_type : false;
     }
+    // True if this NPC's current plane is an attack plane with a live
+    // target. Used by Map::IsTurnPhaseExhausted/BeginTurnPhase to tell
+    // "genuinely engaged, still has something to do" apart from "idle,
+    // will never spend its AP" -- an idle NPC sitting on full AP would
+    // otherwise block the whole shared phase from ever naturally ending.
+    bool            HasCombatTarget();
     AIDataPlane*    GetCurPlane() { return aiPlanes.size() ? aiPlanes[ 0 ]->GetCurPlane() : NULL; }
     AIDataPlaneVec& GetPlanes()   { return aiPlanes; }
     void            DropPlanes();
