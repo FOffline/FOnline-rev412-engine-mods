@@ -4228,6 +4228,8 @@ void FOServer::Process_Combat( Client* cl )
         }
         if( map->IsTurnBasedOn )
             cl->Data.Params[ MODE_END_COMBAT ] = ( val ? 1 : 0 );
+		if( val && map->IsCritterTurn( cl ) )
+            map->TurnBasedEndTick = Timer::GameTick();
     }
     else
     {

@@ -2213,7 +2213,13 @@ void Map::EndTurnPhase()
             Script::SetArgObject( cr );
             Script::SetArgBool( false );
             Script::RunPrepared();
+        }		
+		if( cr->Data.Params[ ST_CURRENT_AP ] > 0 )
+        {
+            cr->ChangeParam( ST_CURRENT_AP );
+            cr->Data.Params[ ST_CURRENT_AP ] = 0;
         }
+
     }
 }
 
