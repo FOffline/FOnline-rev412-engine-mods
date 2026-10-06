@@ -1,5 +1,1051 @@
 #include "StdAfx.h"
 #include "Mapper.h"
+#include <map>
+// ============================================================================
+// Minimap (bottom-right): cached overview of the active map + view rectangle.
+// The map is drawn in screen orientation (same tilt as in the editor), fitted to
+// the area that actually contains tiles/objects. Click / drag to move the camera.
+// Ctrl+N toggles it.
+// ============================================================================
+static AnyFrames* MiniPic = NULL;
+static int        MiniRight = 0, MiniBottom = 0;                       // distance from screen edges
+static int        MiniAL = 6, MiniAT = 6, MiniAR = 306, MiniAB = 306;  // drawing area, relative to the picture
+static bool       MiniVisible = true;
+static bool       MiniDragging = false;
+static bool       MiniRotate = true;                                   // false = raw hex space (square)
+static PointVec   MiniPoints;
+static ProtoMap*  MiniMapKey = NULL;
+static ProtoMap*  MiniCalibKey = NULL;
+static size_t     MiniObjCount = (size_t) -1;
+static uint       MiniLastBuild = 0;
+static int        MiniTileBudget = 0;
+static bool       MiniReady = false;
+
+// hex -> flat coordinates:  X = XA*hx + XB*hy,  Y = YA*hx + YB*hy
+static float MiniXA = 16.0f, MiniXB = -16.0f, MiniYA = 12.0f, MiniYB = 12.0f;
+// flat -> minimap pixel:  px = MiniOx + ( X - MiniMinX ) * MiniS
+static float MiniMinX = 0.0f, MiniMinY = 0.0f, MiniS = 1.0f, MiniOx = 0.0f, MiniOy = 0.0f;
+
+static void MiniLoadIni( IniParser& ini )
+{
+    MiniRight = ini.GetInt( "MinimapRight", 0 );
+    MiniBottom = ini.GetInt( "MinimapBottom", 0 );
+    MiniRotate = ini.GetInt( "MinimapRotate", 1 ) != 0;
+
+    char res[ 256 ] = { 0 };
+    if( ini.GetStr( "MinimapRect", "", res ) && res[ 0 ] )
+    {
+        int l, t, r, b;
+        if( sscanf( res, "%d%d%d%d", &l, &t, &r, &b ) == 4 && r > l && b > t )
+        {
+            MiniAL = l; MiniAT = t; MiniAR = r; MiniAB = b;
+        }
+    }
+
+    char pic[ 1024 ] = { 0 };
+    ini.GetStr( "MinimapPic", "", pic );
+    if( pic[ 0 ] )
+        MiniPic = SprMngr.LoadAnimation( pic, PT_MAPPER_DATA, ANIM_USE_DUMMY );
+}
+
+// Panel rect and drawing area (absolute screen coordinates)
+static void MiniGeom( int& px, int& py, int& pw, int& ph, int& ax, int& ay, int& aw, int& ah )
+{
+    pw = MiniAR;
+    ph = MiniAB;
+    if( MiniPic )
+    {
+        SpriteInfo* si = SprMngr.GetSpriteInfo( MiniPic->GetCurSprId() );
+        if( si )
+        {
+            pw = si->Width;
+            ph = si->Height;
+        }
+    }
+    px = MODE_WIDTH - MiniRight - pw;
+    py = MODE_HEIGHT - MiniBottom - ph;
+    ax = px + MiniAL;
+    ay = py + MiniAT;
+    aw = MiniAR - MiniAL;
+    ah = MiniAB - MiniAT;
+}
+
+// ---- hex <-> screen orientation, measured from the engine itself -------------
+static double MiniDet3( const double m[ 3 ][ 3 ] )
+{
+    return m[ 0 ][ 0 ] * ( m[ 1 ][ 1 ] * m[ 2 ][ 2 ] - m[ 1 ][ 2 ] * m[ 2 ][ 1 ] )
+           - m[ 0 ][ 1 ] * ( m[ 1 ][ 0 ] * m[ 2 ][ 2 ] - m[ 1 ][ 2 ] * m[ 2 ][ 0 ] )
+           + m[ 0 ][ 2 ] * ( m[ 1 ][ 0 ] * m[ 2 ][ 1 ] - m[ 1 ][ 1 ] * m[ 2 ][ 0 ] );
+}
+
+// least squares: V = ca*A + cb*B + c0
+static bool MiniFit( const std::vector<double>& A, const std::vector<double>& B, const std::vector<double>& V, double& ca, double& cb )
+{
+    double n = (double) A.size();
+    double sa = 0, sb = 0, saa = 0, sab = 0, sbb = 0, sv = 0, sav = 0, sbv = 0;
+    for( size_t i = 0; i < A.size(); i++ )
+    {
+        sa += A[ i ]; sb += B[ i ]; sv += V[ i ];
+        saa += A[ i ] * A[ i ]; sab += A[ i ] * B[ i ]; sbb += B[ i ] * B[ i ];
+        sav += A[ i ] * V[ i ]; sbv += B[ i ] * V[ i ];
+    }
+    const double M[ 3 ][ 3 ] = { { saa, sab, sa }, { sab, sbb, sb }, { sa, sb, n } };
+    double       d = MiniDet3( M );
+    if( fabs( d ) < 1e-6 )
+        return false;
+    const double Ma[ 3 ][ 3 ] = { { sav, sab, sa }, { sbv, sbb, sb }, { sv, sb, n } };
+    const double Mb[ 3 ][ 3 ] = { { saa, sav, sa }, { sab, sbv, sb }, { sa, sv, n } };
+    ca = MiniDet3( Ma ) / d;
+    cb = MiniDet3( Mb ) / d;
+    return true;
+}
+
+// Samples screen -> hex from the engine and fits the linear hex -> screen mapping.
+static bool MiniCalibrate()
+{
+    if( !MiniRotate )
+    {
+        MiniXA = 1.0f; MiniXB = 0.0f; MiniYA = 0.0f; MiniYB = 1.0f;
+        return true;
+    }
+
+    std::vector<double> A, B, SX, SY;
+    for( int iy = 0; iy < 5; iy++ )
+    {
+        for( int ix = 0; ix < 5; ix++ )
+        {
+            int    sx = (int) ( MODE_WIDTH * ( 0.1 + 0.2 * ix ) );
+            int    sy = (int) ( MODE_HEIGHT * ( 0.1 + 0.2 * iy ) );
+            ushort a = 0, b = 0;
+            if( FOMapper::Self->HexMngr.GetHexPixel( sx, sy, a, b ) )
+            {
+                A.push_back( a ); B.push_back( b );
+                SX.push_back( sx ); SY.push_back( sy );
+            }
+        }
+    }
+    if( A.size() < 6 )
+        return false;
+
+    double xa, xb, ya, yb;
+    if( !MiniFit( A, B, SX, xa, xb ) || !MiniFit( A, B, SY, ya, yb ) )
+        return false;
+    if( fabs( xa * yb - xb * ya ) < 1e-3 )
+        return false;
+
+    MiniXA = (float) xa; MiniXB = (float) xb; MiniYA = (float) ya; MiniYB = (float) yb;
+    return true;
+}
+
+static void MiniProject( float hx, float hy, float& px, float& py )
+{
+    float X = MiniXA * hx + MiniXB * hy;
+    float Y = MiniYA * hx + MiniYB * hy;
+    px = MiniOx + ( X - MiniMinX ) * MiniS;
+    py = MiniOy + ( Y - MiniMinY ) * MiniS;
+}
+
+static void MiniUnproject( float px, float py, float& hx, float& hy )
+{
+    float X = ( px - MiniOx ) / MiniS + MiniMinX;
+    float Y = ( py - MiniOy ) / MiniS + MiniMinY;
+    float det = MiniXA * MiniYB - MiniXB * MiniYA;
+    if( fabs( det ) < 1e-6f )
+        det = 1e-6f;
+    hx = ( X * MiniYB - MiniXB * Y ) / det;
+    hy = ( MiniXA * Y - MiniYA * X ) / det;
+}
+
+// ---- cache ---------------------------------------------------------------------
+static uint MiniTileColor( uint hash )
+{
+    static std::map<uint, uint> cache;
+    auto it = cache.find( hash );
+    if( it != cache.end() )
+        return it->second;
+
+    uint col = RA_ARGB( 255, 60, 60, 60 );
+    if( MiniTileBudget <= 0 )
+        return col;                 // sample the rest on later rebuilds, avoids a hitch
+    MiniTileBudget--;
+
+    AnyFrames* anim = ResMngr.GetItemAnim( hash );
+    if( anim )
+    {
+        uint        spr = anim->GetCurSprId();
+        SpriteInfo* si = SprMngr.GetSpriteInfo( spr );
+        if( si )
+        {
+            uint c = SprMngr.GetPixColor( spr, si->Width / 2, si->Height / 2, false );
+            if( c >> 24 )
+                col = c | 0xFF000000;
+        }
+    }
+    cache[ hash ] = col;
+    return col;
+}
+
+static void MiniPut( std::vector<uint>& cells, int aw, int ah, int x, int y, int w, int h, uint col )
+{
+    for( int dy = 0; dy < h; dy++ )
+    {
+        for( int dx = 0; dx < w; dx++ )
+        {
+            int cx = x + dx, cy = y + dy;
+            if( cx >= 0 && cy >= 0 && cx < aw && cy < ah )
+                cells[ cy * aw + cx ] = col;
+        }
+    }
+}
+
+// Priority: 1 scenery, 2 walls, 3 items, 4 grids/entries/blockers, 5 critters (0 = skip)
+static int MiniObjClass( MapObject* o, uint& col, int& size )
+{
+    size = 2;
+    if( o->ContainerUID )
+        return 0;
+    if( o->MapObjType == MAP_OBJECT_CRITTER )
+    {
+        col = RA_ARGB( 255, 255, 40, 40 );
+        size = 3;
+        return 5;
+    }
+
+    ushort pid = o->ProtoId;
+    if( pid == 3853 ) { col = RA_ARGB( 255, 0, 230, 230 ); size = 3; return 4; }    // entire
+    if( pid == 3852 ) { col = RA_ARGB( 255, 230, 0, 230 ); size = 3; return 4; }    // trigger
+    if( pid == 4012 ) { col = RA_ARGB( 255, 255, 140, 0 ); size = 2; return 4; }    // scroll blocker
+
+    ProtoItem* proto = ItemMngr.GetProtoItem( pid );
+    if( !proto )
+        return 0;
+    if( proto->IsGrid() ) { col = RA_ARGB( 255, 40, 230, 40 ); size = 3; return 4; }
+    if( proto->IsWall() ) { col = RA_ARGB( 255, 190, 190, 190 ); return 2; }
+    if( proto->IsScen() ) { col = RA_ARGB( 255, 105, 105, 105 ); return 1; }
+    col = RA_ARGB( 255, 240, 220, 40 );
+    return 3;
+}
+
+struct MiniTileRec { int hx, hy; uint hash; };
+struct MiniObjRec  { int hx, hy, prio, size; uint col; };
+
+static void MiniExpand( float hx, float hy, float& minX, float& minY, float& maxX, float& maxY )
+{
+    float X = MiniXA * hx + MiniXB * hy;
+    float Y = MiniYA * hx + MiniYB * hy;
+    if( X < minX ) minX = X;
+    if( X > maxX ) maxX = X;
+    if( Y < minY ) minY = Y;
+    if( Y > maxY ) maxY = Y;
+}
+
+static void MiniRebuild()
+{
+    MiniPoints.clear();
+    MiniReady = false;
+
+    ProtoMap* pm = FOMapper::Self->CurProtoMap;
+    if( !pm )
+        return;
+    int W = pm->Header.MaxHexX;
+    int H = pm->Header.MaxHexY;
+    if( W <= 0 || H <= 0 )
+        return;
+
+    int px, py, pw, ph, ax, ay, aw, ah;
+    MiniGeom( px, py, pw, ph, ax, ay, aw, ah );
+    if( aw <= 0 || ah <= 0 )
+        return;
+
+    // Orientation is measured once per map
+    if( pm != MiniCalibKey && MiniCalibrate() )
+        MiniCalibKey = pm;
+
+    // 1. collect content and its bounds in flat coordinates
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+
+    std::vector<MiniTileRec> tiles;
+    for( int hy = 0; hy < H; hy += 2 )
+    {
+        for( int hx = 0; hx < W; hx += 2 )
+        {
+            ProtoMap::TileVec& tv = pm->GetTiles( (ushort) hx, (ushort) hy, false );
+            if( tv.empty() )
+                continue;
+            MiniTileRec r;
+            r.hx = hx; r.hy = hy; r.hash = tv[ 0 ].NameHash;
+            tiles.push_back( r );
+            MiniExpand( hx + 0.5f, hy + 0.5f, minX, minY, maxX, maxY );
+        }
+    }
+
+    std::vector<MiniObjRec> objs;
+    for( size_t i = 0, j = pm->MObjects.size(); i < j; i++ )
+    {
+        MapObject* o = pm->MObjects[ i ];
+        MiniObjRec r;
+        r.prio = MiniObjClass( o, r.col, r.size );
+        if( !r.prio )
+            continue;
+        r.hx = o->MapX; r.hy = o->MapY;
+        objs.push_back( r );
+        MiniExpand( (float) r.hx, (float) r.hy, minX, minY, maxX, maxY );
+    }
+
+    if( minX > maxX )   // empty map: use the whole hex grid
+    {
+        MiniExpand( 0, 0, minX, minY, maxX, maxY );
+        MiniExpand( (float) W, 0, minX, minY, maxX, maxY );
+        MiniExpand( 0, (float) H, minX, minY, maxX, maxY );
+        MiniExpand( (float) W, (float) H, minX, minY, maxX, maxY );
+    }
+
+    float padX = ( maxX - minX ) * 0.02f + 20.0f;
+    float padY = ( maxY - minY ) * 0.02f + 20.0f;
+    minX -= padX; maxX += padX; minY -= padY; maxY += padY;
+    float bw = maxX - minX, bh = maxY - minY;
+    if( bw < 1.0f ) bw = 1.0f;
+    if( bh < 1.0f ) bh = 1.0f;
+
+    // 2. fit to the drawing area, keep proportions, center
+    float sx = aw / bw, sy = ah / bh;
+    MiniS = ( sx < sy ? sx : sy );
+    MiniMinX = minX;
+    MiniMinY = minY;
+    MiniOx = ax + ( aw - bw * MiniS ) * 0.5f;
+    MiniOy = ay + ( ah - bh * MiniS ) * 0.5f;
+
+    // 3. paint into a pixel grid
+    std::vector<uint> cells( aw * ah, 0 );
+    MiniTileBudget = 150;
+
+    // tile footprint (2x2 hexes) as a rectangle that tiles the plane
+    float tw = ( MiniRotate ? ( fabs( MiniXA ) + fabs( MiniXB ) ) * 2.0f : 2.0f );
+    float th = ( MiniRotate ? ( fabs( MiniYA ) + fabs( MiniYB ) ) : 2.0f );
+    int   tpw = (int) ceil( tw * MiniS );
+    int   tph = (int) ceil( th * MiniS );
+    if( tpw < 1 ) tpw = 1;
+    if( tph < 1 ) tph = 1;
+
+    for( size_t i = 0; i < tiles.size(); i++ )
+    {
+        float cx, cy;
+        MiniProject( tiles[ i ].hx + 0.5f, tiles[ i ].hy + 0.5f, cx, cy );
+        MiniPut( cells, aw, ah, (int) ( cx - ax - tpw * 0.5f ), (int) ( cy - ay - tph * 0.5f ), tpw, tph, MiniTileColor( tiles[ i ].hash ) );
+    }
+
+    for( int prio = 1; prio <= 5; prio++ )
+    {
+        for( size_t i = 0; i < objs.size(); i++ )
+        {
+            if( objs[ i ].prio != prio )
+                continue;
+            float cx, cy;
+            MiniProject( (float) objs[ i ].hx, (float) objs[ i ].hy, cx, cy );
+            int sz = objs[ i ].size;
+            MiniPut( cells, aw, ah, (int) ( cx - ax - sz * 0.5f ), (int) ( cy - ay - sz * 0.5f ), sz, sz, objs[ i ].col );
+        }
+    }
+
+    // 4. cells -> points (absolute screen coordinates)
+    int count = 0;
+    for( size_t i = 0; i < cells.size(); i++ )
+        if( cells[ i ] )
+            count++;
+    MiniPoints.resize( count );
+    int n = 0;
+    for( int y = 0; y < ah; y++ )
+    {
+        for( int x = 0; x < aw; x++ )
+        {
+            uint c = cells[ y * aw + x ];
+            if( !c )
+                continue;
+            PrepPoint& pp = MiniPoints[ n++ ];
+            pp.PointX = ax + x;
+            pp.PointY = ay + y;
+            pp.PointColor = c;
+            pp.PointOffsX = NULL;
+            pp.PointOffsY = NULL;
+        }
+    }
+    MiniReady = true;
+}
+
+static void MiniUpdate()
+{
+    ProtoMap* pm = FOMapper::Self->CurProtoMap;
+    if( !pm )
+        return;
+
+    uint now = Timer::FastTick();
+    bool dirty = ( pm != MiniMapKey ) || ( pm->MObjects.size() != MiniObjCount ) || ( now - MiniLastBuild > 1500 );
+    if( !dirty )
+        return;
+
+    MiniMapKey = pm;
+    MiniObjCount = pm->MObjects.size();
+    MiniLastBuild = now;
+    MiniRebuild();
+}
+
+// screen pixel -> hex; if the point is outside the map, walk towards the screen center
+static bool MiniScreenHex( int sx, int sy, int& hx, int& hy )
+{
+    int cx = MODE_WIDTH / 2, cy = MODE_HEIGHT / 2;
+    for( int step = 0; step <= 16; step++ )
+    {
+        int    x = sx + ( cx - sx ) * step / 16;
+        int    y = sy + ( cy - sy ) * step / 16;
+        ushort a = 0, b = 0;
+        if( FOMapper::Self->HexMngr.GetHexPixel( x, y, a, b ) )
+        {
+            hx = a;
+            hy = b;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void MinimapDraw()
+{
+    FOMapper* m = FOMapper::Self;
+    if( !m->IntVisible || !MiniVisible )
+        return;
+
+    int px, py, pw, ph, ax, ay, aw, ah;
+    MiniGeom( px, py, pw, ph, ax, ay, aw, ah );
+
+    if( MiniPic )
+        SprMngr.DrawSprite( MiniPic, px, py );
+
+    if( !m->HexMngr.IsMapLoaded() || !m->CurProtoMap )
+        return;
+
+    MiniUpdate();
+    if( !MiniReady )
+        return;
+    if( !MiniPoints.empty() )
+        SprMngr.DrawPoints( MiniPoints, PRIMITIVE_POINTLIST );
+
+    // View rectangle (upright in screen orientation), clamped to the drawing area
+    int sxs[ 4 ] = { 0, MODE_WIDTH - 1, MODE_WIDTH - 1, 0 };
+    int sys[ 4 ] = { 0, 0, MODE_HEIGHT - 1, MODE_HEIGHT - 1 };
+    PointVec v;
+    v.resize( 5 );
+    for( int i = 0; i < 4; i++ )
+    {
+        int hx = 0, hy = 0;
+        if( !MiniScreenHex( sxs[ i ], sys[ i ], hx, hy ) )
+            return;
+        float fx, fy;
+        MiniProject( (float) hx, (float) hy, fx, fy );
+        int x = (int) fx, y = (int) fy;
+        if( x < ax ) x = ax;
+        if( x > ax + aw - 1 ) x = ax + aw - 1;
+        if( y < ay ) y = ay;
+        if( y > ay + ah - 1 ) y = ay + ah - 1;
+        v[ i ].PointX = x;
+        v[ i ].PointY = y;
+        v[ i ].PointColor = RA_ARGB( 255, 255, 255, 255 );
+        v[ i ].PointOffsX = NULL;
+        v[ i ].PointOffsY = NULL;
+    }
+    v[ 4 ] = v[ 0 ];
+    SprMngr.DrawPoints( v, PRIMITIVE_LINESTRIP );
+}
+
+static bool MiniCenterAt( int mx, int my )
+{
+    FOMapper* m = FOMapper::Self;
+    if( !m->HexMngr.IsMapLoaded() || !m->CurProtoMap || !MiniReady || MiniS <= 0.0f )
+        return false;
+
+    float fx, fy;
+    MiniUnproject( (float) mx, (float) my, fx, fy );
+    int W = m->CurProtoMap->Header.MaxHexX;
+    int H = m->CurProtoMap->Header.MaxHexY;
+    int hx = (int) ( fx + 0.5f );
+    int hy = (int) ( fy + 0.5f );
+    if( hx < 0 ) hx = 0;
+    if( hy < 0 ) hy = 0;
+    if( hx > W - 1 ) hx = W - 1;
+    if( hy > H - 1 ) hy = H - 1;
+    m->HexMngr.FindSetCenter( hx, hy );
+    return true;
+}
+
+// Left click on the minimap panel (consumed even on the frame so nothing is placed under it)
+static bool MinimapMouseDown()
+{
+    FOMapper* m = FOMapper::Self;
+    if( !m->IntVisible || !MiniVisible )
+        return false;
+
+    int px, py, pw, ph, ax, ay, aw, ah;
+    MiniGeom( px, py, pw, ph, ax, ay, aw, ah );
+    int mx = GameOpt.MouseX, my = GameOpt.MouseY;
+    if( mx < px || mx >= px + pw || my < py || my >= py + ph )
+        return false;
+
+    if( mx >= ax && mx < ax + aw && my >= ay && my < ay + ah && MiniCenterAt( mx, my ) )
+        MiniDragging = true;
+    return true;
+}
+
+static bool MinimapMouseMove()
+{
+    if( !MiniDragging )
+        return false;
+    MiniCenterAt( GameOpt.MouseX, GameOpt.MouseY );
+    return true;
+}
+// ============================================================================
+
+// ============================================================================
+// Undo / Redo   (Ctrl+Z = undo, Ctrl+Y or Ctrl+Shift+Z = redo)
+//
+// How it works
+//  * Every map keeps a short history of snapshots (max UNDO_MAX_STEPS actions).
+//  * After a user action finishes (mouse button released, key pressed, console
+//    command entered) the map is compared with the last snapshot. If something
+//    changed, a new snapshot is pushed. Nothing changed -> nothing is stored.
+//  * Snapshots SHARE unchanged objects / tile cells, so a step only costs memory
+//    for what it really modified.
+//  * One user action == one step, no matter how many objects/tiles it touched
+//    (select 500 objects and move/delete/paste them -> one undo reverts all).
+//  * Typing into a property field is merged into one step.
+//  * Because it diffs the real map data, 
+//    it captures changes detected after mapper input/actions: add, delete,
+//    copy/paste, move, offsets, property edits, tiles, roofs, critters, console
+//    commands, map resize, script changes done as part of an action...
+//  * Cost while editing: one linear scan per click/key press (no per-frame work).
+//    Rebuild of the hex map happens only on undo/redo.
+// ============================================================================
+#include <deque>
+#include <algorithm>
+#include <stddef.h>
+
+#define UNDO_MAX_STEPS         ( 30 )        // how many actions can be undone
+#define UNDO_MAX_WEIGHT        ( 200000 )    // memory guard (~ number of object copies kept in history)
+#define UNDO_TYPING_MERGE_MS   ( 1500 )      // typing in the same property field within this time = one step
+
+// Minimal intrusive ref-counted pointer (old compiler / STLport: no std::shared_ptr)
+template< class T >
+class UndoPtr
+{
+    T* p;
+public:
+    UndoPtr(): p( NULL ) {}
+    explicit UndoPtr( T* x ): p( x ) { if( p ) p->Ref++; }
+    UndoPtr( const UndoPtr& o ): p( o.p ) { if( p ) p->Ref++; }
+    ~UndoPtr() { Reset(); }
+    UndoPtr& operator=( const UndoPtr& o )
+    {
+        if( o.p ) o.p->Ref++;
+        Reset();
+        p = o.p;
+        return *this;
+    }
+    void Reset() { if( p && --p->Ref == 0 ) delete p; p = NULL; }
+    T*   operator->() const { return p; }
+    T*   Get() const { return p; }
+};
+
+struct UndoObjNode
+{
+    int        Ref;
+    MapObject* Obj;
+    UndoObjNode( MapObject* o ): Ref( 0 ), Obj( o ) {}
+    ~UndoObjNode() { if( Obj ) Obj->Release(); }
+};
+
+typedef std::vector< ProtoMap::Tile > UndoTileVec;
+struct UndoTileNode
+{
+    int         Ref;
+    UndoTileVec V;
+    UndoTileNode(): Ref( 0 ) {}
+};
+
+typedef UndoPtr< UndoObjNode >  UndoObjPtr;
+typedef UndoPtr< UndoTileNode > UndoTileVecPtr;
+
+struct UndoCell
+{
+    size_t         Index;   // hy * MaxHexX + hx
+    UndoTileVecPtr Tiles;
+};
+
+struct UndoState
+{
+    std::vector< UndoObjPtr > Objs;     // same order as ProtoMap::MObjects
+    std::vector< UndoCell >   Tiles;    // only non-empty cells, ascending Index
+    std::vector< UndoCell >   Roofs;
+    std::vector< uchar >      Header;   // raw copy of ProtoMap::Header
+    uint                      Weight;   // freshly copied data in this state (memory accounting)
+
+    UndoState(): Weight( 0 ) {}
+    void Swap( UndoState& o )
+    {
+        Objs.swap( o.Objs );
+        Tiles.swap( o.Tiles );
+        Roofs.swap( o.Roofs );
+        Header.swap( o.Header );
+        std::swap( Weight, o.Weight );
+    }
+};
+
+struct UndoHistory
+{
+    std::deque< UndoState >         States;   // States[ Cur ] always matches the live map
+    int                             Cur;
+    std::vector< const MapObject* > Live;     // live pointers matching States[ Cur ].Objs (fast diff)
+    bool                            LastTyped;
+    int                             LastLine;
+    uint                            LastTick;
+    UndoHistory(): Cur( 0 ), LastTyped( false ), LastLine( 0 ), LastTick( 0 ) {}
+};
+
+static std::map< ProtoMap*, UndoHistory* >& UndoTable()
+{
+    static std::map< ProtoMap*, UndoHistory* > table;
+    return table;
+}
+
+static bool UndoDirty = false;   // something may have changed, check at end of input phase
+static bool UndoTyped = false;   // the pending change comes only from typing into a property field
+
+static UndoHistory* UndoFind( ProtoMap* pmap )
+{
+    std::map< ProtoMap*, UndoHistory* >::iterator it = UndoTable().find( pmap );
+    return it != UndoTable().end() ? it->second : NULL;
+}
+
+// Call when a map is freed
+static void UndoForgetMap( ProtoMap* pmap )
+{
+    std::map< ProtoMap*, UndoHistory* >::iterator it = UndoTable().find( pmap );
+    if( it == UndoTable().end() )
+        return;
+    delete it->second;
+    UndoTable().erase( it );
+}
+
+// ---- comparisons -----------------------------------------------------------
+// Compares everything user-visible/editable, ignores runtime-only data (RunTime.*)
+static bool UndoObjEqual( const MapObject& a, const MapObject& b )
+{
+    const size_t rt_off = offsetof( MapObject, RunTime );
+    const size_t rt_end = rt_off + sizeof( a.RunTime );
+    if( memcmp( &a, &b, rt_off ) )
+        return false;
+    if( rt_end < sizeof( MapObject ) && memcmp( (const uchar*) &a + rt_end, (const uchar*) &b + rt_end, sizeof( MapObject ) - rt_end ) )
+        return false;
+    if( memcmp( a.RunTime.PicMapName, b.RunTime.PicMapName, sizeof( a.RunTime.PicMapName ) ) )
+        return false;
+    if( memcmp( a.RunTime.PicInvName, b.RunTime.PicInvName, sizeof( a.RunTime.PicInvName ) ) )
+        return false;
+    return true;
+}
+
+static bool UndoTileEqual( const ProtoMap::Tile& a, const ProtoMap::Tile& b )
+{
+    // IsSelected is intentionally ignored (selection is not an edit)
+    return a.NameHash == b.NameHash && a.HexX == b.HexX && a.HexY == b.HexY &&
+           a.OffsX == b.OffsX && a.OffsY == b.OffsY && a.Layer == b.Layer;
+}
+
+static bool UndoTilesEqual( const UndoTileVec& a, const ProtoMap::TileVec& b )
+{
+    if( a.size() != b.size() )
+        return false;
+    for( size_t i = 0, j = a.size(); i < j; i++ )
+        if( !UndoTileEqual( a[ i ], b[ i ] ) )
+            return false;
+    return true;
+}
+
+// Header is plain data; the camera position (WorkHexX/Y) is not an edit, so it's ignored
+template< class H >
+static void UndoHeaderStore( std::vector< uchar >& dst, const H& h )
+{
+    dst.assign( (const uchar*) &h, (const uchar*) &h + sizeof( H ) );
+}
+
+template< class H >
+static void UndoHeaderLoad( H& h, const std::vector< uchar >& src )
+{
+    if( src.size() == sizeof( H ) )
+        memcpy( &h, &src[ 0 ], sizeof( H ) );
+}
+
+template< class H >
+static bool UndoHeaderSame( const H&, const std::vector< uchar >& a, const std::vector< uchar >& b )
+{
+    if( a.size() != sizeof( H ) || b.size() != sizeof( H ) )
+        return false;
+    H x, y;
+    memcpy( &x, &a[ 0 ], sizeof( H ) );
+    memcpy( &y, &b[ 0 ], sizeof( H ) );
+    x.WorkHexX = y.WorkHexX = 0;
+    x.WorkHexY = y.WorkHexY = 0;
+    return memcmp( &x, &y, sizeof( H ) ) == 0;
+}
+
+// ---- capture ---------------------------------------------------------------
+static void UndoCaptureCells( const ProtoMap::TileVecVec& field, const std::vector< UndoCell >* prev, std::vector< UndoCell >& out, uint& new_tiles, bool& same )
+{
+    size_t p = 0;
+    const size_t pn = prev ? prev->size() : 0;
+    for( size_t i = 0, n = field.size(); i < n; i++ )
+    {
+        while( p < pn && ( *prev )[ p ].Index < i ) // cell that was filled before and is empty now
+        {
+            same = false;
+            p++;
+        }
+        const bool has_prev = ( p < pn && ( *prev )[ p ].Index == i );
+        const ProtoMap::TileVec& tv = field[ i ];
+        if( tv.empty() )
+        {
+            if( has_prev )
+            {
+                same = false;
+                p++;
+            }
+            continue;
+        }
+
+        UndoCell cell;
+        cell.Index = i;
+        if( has_prev && UndoTilesEqual( ( *prev )[ p ].Tiles->V, tv ) )
+            cell.Tiles = ( *prev )[ p ].Tiles;                    // unchanged -> share
+        else
+        {
+            UndoTileNode* node = new UndoTileNode();
+            node->V.assign( tv.begin(), tv.end() );
+            cell.Tiles = UndoTileVecPtr( node );
+            new_tiles += (uint) tv.size();
+            same = false;
+        }
+        if( has_prev )
+            p++;
+        out.push_back( cell );
+    }
+    if( p < pn )
+        same = false;
+}
+
+// Builds a snapshot of the live map. Returns true when it is identical to States[ Cur ] of history h.
+static bool UndoCapture( ProtoMap* pmap, const UndoHistory* h, UndoState& ns )
+{
+    const UndoState* prev = ( h && h->Cur >= 0 && h->Cur < (int) h->States.size() ) ? &h->States[ h->Cur ] : NULL;
+    bool             same = ( prev != NULL );
+
+    // Header
+    UndoHeaderStore( ns.Header, pmap->Header );
+    if( prev && !UndoHeaderSame( pmap->Header, prev->Header, ns.Header ) )
+        same = false;
+
+    // Objects
+    uint new_objs = 0;
+    const size_t count = pmap->MObjects.size();
+    ns.Objs.reserve( count );
+    if( !prev || prev->Objs.size() != count )
+        same = false;
+    const bool can_match = ( prev && h->Live.size() == prev->Objs.size() );
+
+    std::map< const MapObject*, size_t > index;
+    bool index_built = false;
+    for( size_t i = 0; i < count; i++ )
+    {
+        MapObject*        o = pmap->MObjects[ i ];
+        const UndoObjPtr* found = NULL;
+        if( can_match )
+        {
+            if( i < h->Live.size() && h->Live[ i ] == o )
+                found = &prev->Objs[ i ];                       // fast path: same slot, same pointer
+            else
+            {
+                if( !index_built )
+                {
+                    for( size_t k = 0; k < h->Live.size(); k++ )
+                        index[ h->Live[ k ] ] = k;
+                    index_built = true;
+                }
+                std::map< const MapObject*, size_t >::iterator it = index.find( o );
+                if( it != index.end() )
+                    found = &prev->Objs[ it->second ];
+            }
+        }
+
+        if( found && UndoObjEqual( *( *found )->Obj, *o ) )
+            ns.Objs.push_back( *found );                        // unchanged -> share
+        else
+        {
+            ns.Objs.push_back( UndoObjPtr( new UndoObjNode( new MapObject( *o ) ) ) );
+            new_objs++;
+            same = false;
+        }
+    }
+
+    // Tiles / roofs
+    uint new_tiles = 0;
+    UndoCaptureCells( pmap->TilesField, prev ? &prev->Tiles : NULL, ns.Tiles, new_tiles, same );
+    UndoCaptureCells( pmap->RoofsField, prev ? &prev->Roofs : NULL, ns.Roofs, new_tiles, same );
+
+    ns.Weight = new_objs + new_tiles / 8;
+    return same;
+}
+
+static void UndoRefreshLive( ProtoMap* pmap, UndoHistory* h )
+{
+    h->Live.assign( pmap->MObjects.begin(), pmap->MObjects.end() );
+}
+
+static UndoHistory* UndoCreate( ProtoMap* pmap )
+{
+    UndoHistory* h = new UndoHistory();
+    UndoState    ns;
+    UndoCapture( pmap, NULL, ns );
+    h->States.push_back( UndoState() );
+    h->States.back().Swap( ns );
+    h->Cur = 0;
+    UndoRefreshLive( pmap, h );
+    UndoTable()[ pmap ] = h;
+    return h;
+}
+
+static void UndoTrim( UndoHistory* h )
+{
+    while( (int) h->States.size() > UNDO_MAX_STEPS + 1 )
+    {
+        h->States.pop_front();
+        h->Cur--;
+    }
+    for( ;; )
+    {
+        uint total = 0;
+        for( size_t i = 0; i < h->States.size(); i++ )
+            total += h->States[ i ].Weight;
+        if( total <= UNDO_MAX_WEIGHT || h->States.size() <= 3 || h->Cur < 1 )
+            break;
+        h->States.pop_front();    // memory guard: very large maps / huge actions keep fewer steps
+        h->Cur--;
+    }
+}
+
+// ---- commit (called after a user action) -------------------------------------
+static void UndoCommit( FOMapper* m, ProtoMap* pmap, UndoHistory* h )
+{
+    UndoDirty = false;
+    const bool typed = UndoTyped;
+    UndoTyped = false;
+
+    UndoState ns;
+    if( UndoCapture( pmap, h, ns ) )
+        return;                                                 // nothing changed (selection, camera, hover...)
+
+    const int  line = (int) m->ObjCurLine;
+    const uint now = Timer::FastTick();
+
+    // New action invalidates redo branch
+    while( (int) h->States.size() > h->Cur + 1 )
+        h->States.pop_back();
+
+    const bool merge = typed && h->LastTyped && h->LastLine == line && h->Cur >= 1 && ( now - h->LastTick ) < UNDO_TYPING_MERGE_MS;
+    if( merge )
+        h->States[ h->Cur ].Swap( ns );
+    else
+    {
+        h->States.push_back( UndoState() );
+        h->States.back().Swap( ns );
+        h->Cur++;
+    }
+    h->LastTyped = typed;
+    h->LastLine = line;
+    h->LastTick = now;
+
+    UndoRefreshLive( pmap, h );
+    UndoTrim( h );
+}
+
+// ---- apply a snapshot to the live map ------------------------------------------
+static bool UndoApply( FOMapper* m, ProtoMap* pmap, const UndoState& st )
+{
+    m->SelectClear();
+    m->HexMngr.ClearSelTiles();
+    m->InContObject = NULL;
+
+    // Remember camera
+    m->HexMngr.GetScreenHexes( pmap->Header.WorkHexX, pmap->Header.WorkHexY );
+    int wx = pmap->Header.WorkHexX;
+    int wy = pmap->Header.WorkHexY;
+
+    // Header (map size, day time, script...)
+    UndoHeaderLoad( pmap->Header, st.Header );
+    if( wx >= (int) pmap->Header.MaxHexX )
+        wx = (int) pmap->Header.MaxHexX - 1;
+    if( wy >= (int) pmap->Header.MaxHexY )
+        wy = (int) pmap->Header.MaxHexY - 1;
+    pmap->Header.WorkHexX = wx;
+    pmap->Header.WorkHexY = wy;
+
+    // Objects
+    for( size_t i = 0; i < pmap->MObjects.size(); i++ )
+        pmap->MObjects[ i ]->Release();
+    pmap->MObjects.clear();
+    pmap->MObjects.reserve( st.Objs.size() + 16 );
+    for( size_t i = 0; i < st.Objs.size(); i++ )
+    {
+        MapObject* o = new MapObject( *st.Objs[ i ]->Obj );
+        o->RunTime.FromMap = pmap;
+        o->RunTime.MapObjId = 0;                                // fresh hex-map id is assigned by SetProtoMap, like on map load
+        pmap->MObjects.push_back( o );
+    }
+
+    // Tiles / roofs
+    const size_t cells = (size_t) pmap->Header.MaxHexX * (size_t) pmap->Header.MaxHexY;
+    for( int r = 0; r <= 1; r++ )
+    {
+        ProtoMap::TileVecVec&        field = ( r ? pmap->RoofsField : pmap->TilesField );
+        const std::vector< UndoCell >& src = ( r ? st.Roofs : st.Tiles );
+        field.clear();
+        field.resize( cells );
+        for( size_t i = 0; i < src.size(); i++ )
+        {
+            if( src[ i ].Index >= cells )
+                continue;
+            ProtoMap::TileVec& tv = field[ src[ i ].Index ];
+            tv.assign( src[ i ].Tiles->V.begin(), src[ i ].Tiles->V.end() );
+            for( size_t k = 0; k < tv.size(); k++ )
+                tv[ k ].IsSelected = false;
+        }
+    }
+
+    // Rebuild hex map from proto map (same path as map resize)
+    m->HexMngr.UnloadMap();
+    if( !m->HexMngr.SetProtoMap( *pmap ) )
+        return false;
+    m->HexMngr.FindSetCenter( pmap->Header.WorkHexX, pmap->Header.WorkHexY );
+    m->HexMngr.RefreshMap();
+    return true;
+}
+
+// dir = -1 undo, +1 redo
+static void UndoStep( int dir )
+{
+    FOMapper* m = FOMapper::Self;
+    ProtoMap* pmap = m->CurProtoMap;
+    if( !pmap || !m->HexMngr.IsMapLoaded() || m->IntHold != INT_NONE )
+        return;
+
+    UndoHistory* h = UndoFind( pmap );
+    if( !h )
+        return;
+    if( UndoDirty )
+        UndoCommit( m, pmap, h );                               // flush pending action first
+
+    const int target = h->Cur + dir;
+    if( target < 0 )
+    {
+        m->AddMess( "Nothing to undo." );
+        return;
+    }
+    if( target >= (int) h->States.size() )
+    {
+        m->AddMess( "Nothing to redo." );
+        return;
+    }
+
+    const bool ok = UndoApply( m, pmap, h->States[ target ] );
+	
+	if( !ok )
+	{
+		m->AddMess( "Undo/Redo: map rebuild failed, see log." );
+		return;
+	}
+    h->Cur = target;
+    h->LastTyped = false;
+    UndoRefreshLive( pmap, h );
+    UndoDirty = false;
+    UndoTyped = false;
+
+    if( !ok )
+        m->AddMess( "Undo/Redo: map rebuild failed, see log." );
+    else if( dir < 0 )
+        m->AddMessFormat( "Undo. Steps left: %d.", h->Cur );
+    else
+        m->AddMessFormat( "Redo. Steps left: %d.", (int) h->States.size() - 1 - h->Cur );
+}
+
+static void UndoUndo() { UndoStep( -1 ); }
+static void UndoRedo() { UndoStep( +1 ); }
+
+// ---- hooks ----------------------------------------------------------------------
+// Mouse button released: a click / drag / stroke is finished
+static void UndoMarkDirty()
+{
+    UndoTyped = false;
+    UndoDirty = true;
+}
+
+// Key pressed (called for every key down event that reaches the hotkey handler)
+static void UndoOnKeyDown( uchar dik )
+{
+    FOMapper* m = FOMapper::Self;
+    if( dik == DIK_LCONTROL || dik == DIK_RCONTROL || dik == DIK_LSHIFT || dik == DIK_RSHIFT || dik == DIK_LMENU || dik == DIK_RMENU )
+        return;
+    if( Keyb::CtrlDwn && ( dik == DIK_Z || dik == DIK_Y ) )
+        return;                                                 // undo / redo themselves
+    if( m->ConsoleEdit && dik != DIK_RETURN && dik != DIK_NUMPADENTER )
+        return;                                                 // typing a console command, wait for Enter
+
+    const bool special = Keyb::CtrlDwn || Keyb::AltDwn || dik == DIK_LEFT || dik == DIK_RIGHT || dik == DIK_UP || dik == DIK_DOWN ||
+                         dik == DIK_DELETE || dik == DIK_RETURN || dik == DIK_NUMPADENTER || dik == DIK_ESCAPE || dik == DIK_TAB;
+    const bool typed = !special && !m->SelectedObj.empty() && m->ObjVisible;
+    UndoTyped = UndoDirty ? ( UndoTyped && typed ) : typed;
+    UndoDirty = true;
+}
+
+// Once per frame after input was processed
+// Safety net: drop histories of maps that are not loaded anymore (a new map may reuse the same address)
+static void UndoPurge( FOMapper* m )
+{
+    std::map< ProtoMap*, UndoHistory* >& table = UndoTable();
+    for( std::map< ProtoMap*, UndoHistory* >::iterator it = table.begin(); it != table.end(); )
+    {
+        if( it->first != m->CurProtoMap && std::find( m->LoadedProtoMaps.begin(), m->LoadedProtoMaps.end(), it->first ) == m->LoadedProtoMaps.end() )
+        {
+            delete it->second;
+            table.erase( it++ );
+        }
+        else
+            ++it;
+    }
+}
+
+static void UndoUpdate()
+{
+    FOMapper* m = FOMapper::Self;
+    UndoPurge( m );
+    ProtoMap* pmap = m->CurProtoMap;
+    if( !pmap || !m->HexMngr.IsMapLoaded() )
+        return;
+
+    UndoHistory* h = UndoFind( pmap );
+    if( !h )
+    {
+        UndoCreate( pmap );                                     // first time we see this map: baseline snapshot
+        UndoDirty = false;
+        UndoTyped = false;
+        return;
+    }
+    if( UndoDirty && m->IntHold == INT_NONE )                   // while dragging, wait for the mouse release
+        UndoCommit( m, pmap, h );
+}
 
 void _PreRestore()
 {
@@ -421,6 +1467,7 @@ int FOMapper::InitIface()
 
     IfaceLoadRect( SubTabsRect, "SubTabs" );
 
+    MiniLoadIni( ini );
     IntVisible = true;
     IntFix = true;
     IntMode = INT_MODE_MESS;
@@ -810,6 +1857,10 @@ void FOMapper::ParseKeyboard()
         else if( dikup == DIK_LSHIFT || dikup == DIK_RSHIFT )
             Keyb::ShiftDwn = false;
 
+        // Undo/redo bookkeeping: remember that something may be changed by this key
+        if( dikdw )
+            UndoOnKeyDown( dikdw );
+
         // Hotkeys
         if( !Keyb::AltDwn && !Keyb::CtrlDwn && !Keyb::ShiftDwn )
         {
@@ -971,6 +2022,19 @@ void FOMapper::ParseKeyboard()
             case DIK_V:
                 BufferPaste( 50, 50 );
                 break;
+            case DIK_Z:
+                if( !ConsoleEdit )
+                {
+                    if( Keyb::ShiftDwn )
+                        UndoRedo();
+                    else
+                        UndoUndo();
+                }
+                break;
+            case DIK_Y:
+                if( !ConsoleEdit )
+                    UndoRedo();
+                break;
             case DIK_A:
                 SelectAll();
                 break;
@@ -996,6 +2060,9 @@ void FOMapper::ParseKeyboard()
                 break;
             case DIK_L:
                 SaveLogFile();
+                break;
+            case DIK_N:
+                MiniVisible = !MiniVisible;
                 break;
             default:
                 break;
@@ -1173,6 +2240,10 @@ void FOMapper::ParseMouse()
         int event = events[ i ];
         int event_button = events[ i + 1 ];
         int event_dy = -events[ i + 2 ];
+
+        // Undo bookkeeping: a click / drag / stroke has finished
+        if( event == FL_RELEASE )
+            UndoMarkDirty();
 
         // Scripts
         bool script_result = false;
@@ -1433,6 +2504,7 @@ void FOMapper::MainLoop()
     ConsoleProcess();
     ParseKeyboard();
     ParseMouse();
+    UndoUpdate();
 
     // Process
     AnimProcess();
@@ -1558,6 +2630,7 @@ void FOMapper::MainLoop()
     ConsoleDraw();
     DrawIfaceLayer( 3 );
     ObjDraw();
+	MinimapDraw();
     DrawIfaceLayer( 4 );
     CurDraw();
     DrawIfaceLayer( 5 );
@@ -2631,7 +3704,9 @@ void FOMapper::IntLMouseDown()
 {
     IntHold = INT_NONE;
 
-    // Sub tabs
+if( MinimapMouseDown() )
+        return;    
+   // Sub tabs
     if( IntVisible && SubTabsActive )
     {
         if( IsCurInRect( SubTabsRect, SubTabsX, SubTabsY ) )
@@ -3161,6 +4236,8 @@ void FOMapper::IntLMouseDown()
 
 void FOMapper::IntLMouseUp()
 {
+    MiniDragging = false;
+
     if( IntHold == INT_SELECT && HexMngr.GetHexPixel( GameOpt.MouseX, GameOpt.MouseY, SelectHX2, SelectHY2 ) )
     {
         if( CurMode == CUR_MODE_DEFAULT )
@@ -3264,6 +4341,9 @@ void FOMapper::IntLMouseUp()
 
 void FOMapper::IntMouseMove()
 {
+    if( MinimapMouseMove() )
+        return;
+
     if( IntHold == INT_SELECT )
     {
         HexMngr.ClearHexTrack();
@@ -4955,6 +6035,7 @@ void FOMapper::ParseCommand( const char* cmd )
 
             LoadedProtoMaps.erase( it );
             SelectedObj.clear();
+            UndoForgetMap( CurProtoMap );
             CurProtoMap->Clear();
             SAFEREL( CurProtoMap );
 
@@ -5928,6 +7009,7 @@ void FOMapper::SScriptFunc::Global_UnloadMap( ProtoMap* pmap )
         Self->SelectedObj.clear();
         SAFEREL( Self->CurProtoMap );
     }
+    UndoForgetMap( pmap );
     pmap->Clear();
     pmap->Release();
 }
