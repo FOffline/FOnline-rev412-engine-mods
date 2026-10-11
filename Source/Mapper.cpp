@@ -408,6 +408,142 @@ static bool MiniScreenHex( int sx, int sy, int& hx, int& hy )
     return false;
 }
 
+// ---- view marker -------------------------------------------------------------
+// Screen -> hex measured from the engine EVERY frame:  screen = M * hex + c  (least squares over a grid
+// of screen points; hex lookups are whole hexes, so many far-apart points are needed). Unlike looking up
+// the 4 screen corners, this keeps working when corners lie outside the map (new / small maps, sides).
+// With very few hits (tiny map, view at its edge) only the offset c is re-measured; M comes from the last
+// good fit, corrected for the zoom change (pixels per hex ~ 1 / SpritesZoom, see VIEW_WIDTH).
+static bool MiniViewCorners( float fx[ 4 ], float fy[ 4 ] )
+{
+    static double LM[ 2 ][ 2 ], Lc[ 2 ], Lz = 1.0;
+    static bool   Lok = false;
+
+    std::vector<double> A, B, SX, SY;
+    for( int iy = 0; iy < 12; iy++ )
+    {
+        for( int ix = 0; ix < 20; ix++ )
+        {
+            int    sx = (int) ( MODE_WIDTH * ( 0.025 + 0.05 * ix ) );
+            int    sy = (int) ( MODE_HEIGHT * ( 0.04 + 0.08 * iy ) );
+            ushort a = 0, b = 0;
+            if( FOMapper::Self->HexMngr.GetHexPixel( sx, sy, a, b ) )
+            {
+                A.push_back( a ); B.push_back( b );
+                SX.push_back( sx ); SY.push_back( sy );
+            }
+        }
+    }
+    const double zn = ( GameOpt.SpritesZoom > 0.0f ? (double) GameOpt.SpritesZoom : 1.0 );
+    const double n = (double) A.size();
+    double       ma = 0, mb = 0, mx = 0, my = 0;
+    for( size_t i = 0; i < A.size(); i++ )
+    {
+        ma += A[ i ]; mb += B[ i ]; mx += SX[ i ]; my += SY[ i ];
+    }
+    if( n > 0 )
+    {
+        ma /= n; mb /= n; mx /= n; my /= n;
+    }
+
+    double M[ 2 ][ 2 ], c[ 2 ];
+    bool   have = false;
+    if( A.size() >= 30 && MiniFit( A, B, SX, M[ 0 ][ 0 ], M[ 0 ][ 1 ] ) && MiniFit( A, B, SY, M[ 1 ][ 0 ], M[ 1 ][ 1 ] ) &&
+        fabs( M[ 0 ][ 0 ] * M[ 1 ][ 1 ] - M[ 0 ][ 1 ] * M[ 1 ][ 0 ] ) > 1e-6 )
+    {
+        c[ 0 ] = mx - M[ 0 ][ 0 ] * ma - M[ 0 ][ 1 ] * mb;
+        c[ 1 ] = my - M[ 1 ][ 0 ] * ma - M[ 1 ][ 1 ] * mb;
+        memcpy( LM, M, sizeof( LM ) );
+        memcpy( Lc, c, sizeof( Lc ) );
+        Lz = zn;
+        Lok = true;
+        have = true;
+    }
+    if( !have )
+    {
+        if( !Lok )
+            return false;
+        const double k = Lz / zn;
+        for( int i = 0; i < 2; i++ )
+            for( int j = 0; j < 2; j++ )
+                M[ i ][ j ] = LM[ i ][ j ] * k;
+        if( n >= 1 )
+        {
+            c[ 0 ] = mx - M[ 0 ][ 0 ] * ma - M[ 0 ][ 1 ] * mb;
+            c[ 1 ] = my - M[ 1 ][ 0 ] * ma - M[ 1 ][ 1 ] * mb;
+        }
+        else
+        {
+            c[ 0 ] = Lc[ 0 ];
+            c[ 1 ] = Lc[ 1 ];
+        }
+    }
+
+    const double det = M[ 0 ][ 0 ] * M[ 1 ][ 1 ] - M[ 0 ][ 1 ] * M[ 1 ][ 0 ];
+    const int    sxs[ 4 ] = { 0, MODE_WIDTH, MODE_WIDTH, 0 };
+    const int    sys[ 4 ] = { 0, 0, MODE_HEIGHT, MODE_HEIGHT };
+
+    if( MiniRotate )
+    {
+        // flat space IS the screen (up to one scale factor), so the view is an exact rectangle
+        const double dx = MODE_WIDTH * 0.5 - c[ 0 ], dy = MODE_HEIGHT * 0.5 - c[ 1 ];
+        const float  hx = (float) ( ( M[ 1 ][ 1 ] * dx - M[ 0 ][ 1 ] * dy ) / det );
+        const float  hy = (float) ( ( -M[ 1 ][ 0 ] * dx + M[ 0 ][ 0 ] * dy ) / det );
+        float        cx, cy;
+        MiniProject( hx, hy, cx, cy );
+        const double s = sqrt( fabs( MiniXA * MiniYB - MiniXB * MiniYA ) / fabs( det ) );   // zoom now vs. at calibration
+        const float  hw = (float) ( s * MODE_WIDTH * 0.5 * MiniS ), hh = (float) ( s * MODE_HEIGHT * 0.5 * MiniS );
+        fx[ 0 ] = cx - hw; fy[ 0 ] = cy - hh;
+        fx[ 1 ] = cx + hw; fy[ 1 ] = cy - hh;
+        fx[ 2 ] = cx + hw; fy[ 2 ] = cy + hh;
+        fx[ 3 ] = cx - hw; fy[ 3 ] = cy + hh;
+        return true;
+    }
+    // raw hex space: the view is a rhombus there by nature
+    for( int i = 0; i < 4; i++ )
+    {
+        const double dx = sxs[ i ] - c[ 0 ], dy = sys[ i ] - c[ 1 ];
+        MiniProject( (float) ( ( M[ 1 ][ 1 ] * dx - M[ 0 ][ 1 ] * dy ) / det ), (float) ( ( -M[ 1 ][ 0 ] * dx + M[ 0 ][ 0 ] * dy ) / det ), fx[ i ], fy[ i ] );
+    }
+    return true;
+}
+
+// Liang-Barsky: clip a line to a rectangle; false if nothing is left
+static bool MiniClipLine( float& x0, float& y0, float& x1, float& y1, float xmin, float ymin, float xmax, float ymax )
+{
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float p[ 4 ] = { -dx, dx, -dy, dy };
+    const float q[ 4 ] = { x0 - xmin, xmax - x0, y0 - ymin, ymax - y0 };
+    float       t0 = 0.0f, t1 = 1.0f;
+    for( int i = 0; i < 4; i++ )
+    {
+        if( p[ i ] == 0.0f )
+        {
+            if( q[ i ] < 0.0f )
+                return false;
+            continue;
+        }
+        const float t = q[ i ] / p[ i ];
+        if( p[ i ] < 0.0f )
+        {
+            if( t > t1 )
+                return false;
+            if( t > t0 )
+                t0 = t;
+        }
+        else
+        {
+            if( t < t0 )
+                return false;
+            if( t < t1 )
+                t1 = t;
+        }
+    }
+    const float nx0 = x0 + t0 * dx, ny0 = y0 + t0 * dy, nx1 = x0 + t1 * dx, ny1 = y0 + t1 * dy;
+    x0 = nx0; y0 = ny0; x1 = nx1; y1 = ny1;
+    return true;
+}
+
 static void MinimapDraw()
 {
     FOMapper* m = FOMapper::Self;
@@ -429,31 +565,28 @@ static void MinimapDraw()
     if( !MiniPoints.empty() )
         SprMngr.DrawPoints( MiniPoints, PRIMITIVE_POINTLIST );
 
-    // View rectangle (upright in screen orientation), clamped to the drawing area
-    int sxs[ 4 ] = { 0, MODE_WIDTH - 1, MODE_WIDTH - 1, 0 };
-    int sys[ 4 ] = { 0, 0, MODE_HEIGHT - 1, MODE_HEIGHT - 1 };
-    PointVec v;
-    v.resize( 5 );
-    for( int i = 0; i < 4; i++ )
+    // View marker: straight edges, clipped to the drawing area (never squeezed onto the map)
+    float fxs[ 4 ], fys[ 4 ];
+    if( !MiniViewCorners( fxs, fys ) )
+        return;
+    for( int e = 0; e < 4; e++ )
     {
-        int hx = 0, hy = 0;
-        if( !MiniScreenHex( sxs[ i ], sys[ i ], hx, hy ) )
-            return;
-        float fx, fy;
-        MiniProject( (float) hx, (float) hy, fx, fy );
-        int x = (int) fx, y = (int) fy;
-        if( x < ax ) x = ax;
-        if( x > ax + aw - 1 ) x = ax + aw - 1;
-        if( y < ay ) y = ay;
-        if( y > ay + ah - 1 ) y = ay + ah - 1;
-        v[ i ].PointX = x;
-        v[ i ].PointY = y;
-        v[ i ].PointColor = RA_ARGB( 255, 255, 255, 255 );
-        v[ i ].PointOffsX = NULL;
-        v[ i ].PointOffsY = NULL;
+        const int j = ( e + 1 ) % 4;
+        float     x0 = fxs[ e ], y0 = fys[ e ], x1 = fxs[ j ], y1 = fys[ j ];
+        if( !MiniClipLine( x0, y0, x1, y1, (float) ax, (float) ay, (float) ( ax + aw - 1 ), (float) ( ay + ah - 1 ) ) )
+            continue;
+        PointVec v;
+        v.resize( 2 );
+        for( int k = 0; k < 2; k++ )
+        {
+            v[ k ].PointX = (int) ( k ? x1 : x0 );
+            v[ k ].PointY = (int) ( k ? y1 : y0 );
+            v[ k ].PointColor = RA_ARGB( 255, 255, 255, 255 );
+            v[ k ].PointOffsX = NULL;
+            v[ k ].PointOffsY = NULL;
+        }
+        SprMngr.DrawPoints( v, PRIMITIVE_LINESTRIP );
     }
-    v[ 4 ] = v[ 0 ];
-    SprMngr.DrawPoints( v, PRIMITIVE_LINESTRIP );
 }
 
 static bool MiniCenterAt( int mx, int my )
