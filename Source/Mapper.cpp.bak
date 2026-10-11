@@ -1,1 +1,0 @@
-static int        MiniAL = 6, MiniAT = 6, MiniAR = 306, MiniAB = 306;  // drawing area, relative to the picture
