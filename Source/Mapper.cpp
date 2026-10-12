@@ -1,6 +1,7 @@
 #include "StdAfx.h"
 #include "Mapper.h"
 #include <map>
+#include <set>
 // ============================================================================
 // Minimap (bottom-right): cached overview of the active map + view rectangle.
 // The map is drawn in screen orientation (same tilt as in the editor), fitted to
@@ -748,6 +749,7 @@ static std::map< ProtoMap*, UndoHistory* >& UndoTable()
 }
 
 static bool UndoDirty = false;   // something may have changed, check at end of input phase
+static bool MapGenPreviewActive = false;   // MapGen preview is in the map: it is not an undo step until Apply
 static bool UndoTyped = false;   // the pending change comes only from typing into a property field
 
 static UndoHistory* UndoFind( ProtoMap* pmap )
@@ -1074,6 +1076,11 @@ static void UndoStep( int dir )
     ProtoMap* pmap = m->CurProtoMap;
     if( !pmap || !m->HexMngr.IsMapLoaded() || m->IntHold != INT_NONE )
         return;
+    if( MapGenPreviewActive )
+    {
+        m->AddMess( "MapGen preview is active: Apply or Cancel it first." );
+        return;
+    }
 
     UndoHistory* h = UndoFind( pmap );
     if( !h )
@@ -1176,6 +1183,12 @@ static void UndoUpdate()
         UndoTyped = false;
         return;
     }
+    if( MapGenPreviewActive )                                   // MapGen preview is not an edit; Apply makes it one step
+    {
+        UndoDirty = false;
+        UndoTyped = false;
+        return;
+    }
     if( UndoDirty && m->IntHold == INT_NONE )                   // while dragging, wait for the mouse release
         UndoCommit( m, pmap, h );
 }
@@ -1193,6 +1206,8 @@ void _PostRestore()
 
 bool      FOMapper::SpritesCanDraw = false;
 FOMapper* FOMapper::Self = NULL;
+#include "MapGen.inc"
+
 FOMapper::FOMapper()
 {
     Self = this;
@@ -1601,6 +1616,7 @@ int FOMapper::InitIface()
     IfaceLoadRect( SubTabsRect, "SubTabs" );
 
     MiniLoadIni( ini );
+    MapGenLoadButtonIni( ini );
     IntVisible = true;
     IntFix = true;
     IntMode = INT_MODE_MESS;
@@ -2567,7 +2583,10 @@ void FOMapper::ParseMouse()
             }
             else
             {
-                if( event_dy )
+                if( MapGenWheel( event_dy ) )
+                {
+                }
+                else if( event_dy )
                     HexMngr.ChangeZoom( event_dy > 0 ? -1 : 1 );
             }
             continue;
@@ -2638,6 +2657,7 @@ void FOMapper::MainLoop()
     ParseKeyboard();
     ParseMouse();
     UndoUpdate();
+    MapGenProcess();
 
     // Process
     AnimProcess();
@@ -2764,6 +2784,7 @@ void FOMapper::MainLoop()
     DrawIfaceLayer( 3 );
     ObjDraw();
 	MinimapDraw();
+	MapGenDraw();
     DrawIfaceLayer( 4 );
     CurDraw();
     DrawIfaceLayer( 5 );
@@ -3838,6 +3859,8 @@ void FOMapper::IntLMouseDown()
     IntHold = INT_NONE;
 
 if( MinimapMouseDown() )
+        return;
+    if( MapGenMouseDown() )
         return;    
    // Sub tabs
     if( IntVisible && SubTabsActive )
@@ -4370,6 +4393,7 @@ if( MinimapMouseDown() )
 void FOMapper::IntLMouseUp()
 {
     MiniDragging = false;
+    MapGenMouseUp();
 
     if( IntHold == INT_SELECT && HexMngr.GetHexPixel( GameOpt.MouseX, GameOpt.MouseY, SelectHX2, SelectHY2 ) )
     {
@@ -4474,6 +4498,8 @@ void FOMapper::IntLMouseUp()
 
 void FOMapper::IntMouseMove()
 {
+    if( MapGenMouseMove() )
+        return;
     if( MinimapMouseMove() )
         return;
 
