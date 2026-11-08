@@ -13,6 +13,8 @@ static int        MiniRight = 0, MiniBottom = 0;                       // distan
 static int        MiniAL = 6, MiniAT = 6, MiniAR = 306, MiniAB = 306;  // drawing area, relative to the picture
 static bool       MiniVisible = true;
 static bool       MiniDragging = false;
+static bool       MiniMoving = false;                                  // dragging the frame moves the whole minimap
+static int        MiniGrabX = 0, MiniGrabY = 0;                        // where on the panel the move started
 static bool       MiniRotate = true;                                   // false = raw hex space (square)
 static PointVec   MiniPoints;
 static ProtoMap*  MiniMapKey = NULL;
@@ -623,13 +625,33 @@ static bool MinimapMouseDown()
     if( mx < px || mx >= px + pw || my < py || my >= py + ph )
         return false;
 
-    if( mx >= ax && mx < ax + aw && my >= ay && my < ay + ah && MiniCenterAt( mx, my ) )
+    if( !( mx >= ax && mx < ax + aw && my >= ay && my < ay + ah ) )   // click on the frame (outside the map area) and drag: move the minimap
+    {
+        MiniMoving = true;
+        MiniGrabX = mx - px;
+        MiniGrabY = my - py;
+        return true;
+    }
+    if( MiniCenterAt( mx, my ) )
         MiniDragging = true;
     return true;
 }
 
 static bool MinimapMouseMove()
 {
+    if( MiniMoving )
+    {
+        int px, py, pw, ph, ax, ay, aw, ah;
+        MiniGeom( px, py, pw, ph, ax, ay, aw, ah );
+        int nx = GameOpt.MouseX - MiniGrabX, ny = GameOpt.MouseY - MiniGrabY;   // new top-left corner
+        if( nx > MODE_WIDTH - pw )  nx = MODE_WIDTH - pw;
+        if( ny > MODE_HEIGHT - ph ) ny = MODE_HEIGHT - ph;
+        if( nx < 0 ) nx = 0;
+        if( ny < 0 ) ny = 0;
+        MiniRight = MODE_WIDTH - pw - nx;               // same variables the ini uses, so the layout code needs no change
+        MiniBottom = MODE_HEIGHT - ph - ny;
+        return true;
+    }
     if( !MiniDragging )
         return false;
     MiniCenterAt( GameOpt.MouseX, GameOpt.MouseY );
@@ -1207,6 +1229,8 @@ void _PostRestore()
 bool      FOMapper::SpritesCanDraw = false;
 FOMapper* FOMapper::Self = NULL;
 #include "MapGen.inc"
+#include "Brush.inc"
+#include "Autowall.inc"
 
 FOMapper::FOMapper()
 {
@@ -2658,6 +2682,8 @@ void FOMapper::MainLoop()
     ParseMouse();
     UndoUpdate();
     MapGenProcess();
+    BrushProcess();
+    AutowallProcess();
 
     // Process
     AnimProcess();
@@ -2785,6 +2811,8 @@ void FOMapper::MainLoop()
     ObjDraw();
 	MinimapDraw();
 	MapGenDraw();
+    BrushDraw();
+    AutowallDraw();
     DrawIfaceLayer( 4 );
     CurDraw();
     DrawIfaceLayer( 5 );
@@ -3860,8 +3888,17 @@ void FOMapper::IntLMouseDown()
 
 if( MinimapMouseDown() )
         return;
+    if( IsCurInRect( MapGenBtn ) )      // only one floating panel at a time
+    {
+        BrushClose();
+        AwClose();
+    }
     if( MapGenMouseDown() )
-        return;    
+        return;
+    if( BrushMouseDown() )
+        return;
+    if( AutowallMouseDown() )
+        return;
    // Sub tabs
     if( IntVisible && SubTabsActive )
     {
@@ -4392,8 +4429,13 @@ if( MinimapMouseDown() )
 
 void FOMapper::IntLMouseUp()
 {
+    if( MiniMoving )
+        FOMapper::Self->AddMessFormat( "Minimap moved. To keep it, put MinimapRight=%d and MinimapBottom=%d in the ini.", MiniRight, MiniBottom );
+    MiniMoving = false;
     MiniDragging = false;
     MapGenMouseUp();
+    BrushMouseUp();
+    AutowallMouseUp();
 
     if( IntHold == INT_SELECT && HexMngr.GetHexPixel( GameOpt.MouseX, GameOpt.MouseY, SelectHX2, SelectHY2 ) )
     {
@@ -4500,6 +4542,10 @@ void FOMapper::IntMouseMove()
 {
     if( MapGenMouseMove() )
         return;
+    if( BrushMouseMove() )
+        return;
+    if( AutowallMouseMove() )
+        return;
     if( MinimapMouseMove() )
         return;
 
@@ -4582,6 +4628,149 @@ void FOMapper::SetTabIndex( uint index )
     if( IntMode < TAB_COUNT )
         TabsActive[ IntMode ]->Index = index;
     TabIndex[ IntMode ] = index;
+}
+
+// Select an asset (0 item, 1 tile, 2 critter) in the panel: finds the best tab that contains it
+bool FOMapper::SelectAssetInPanel( int type, uint id )
+{
+    int     best_mode = -1;
+    SubTab* best_stab = NULL;
+    int     best_index = -1;
+    int     best_score = 0;
+
+    for( int mode = 0; mode < TAB_COUNT; mode++ )
+    {
+        if( mode == INT_MODE_IGNORE )
+            continue;
+
+        for( auto it = Tabs[ mode ].begin(), end = Tabs[ mode ].end(); it != end; ++it )
+        {
+            SubTab& st = ( *it ).second;
+            int     idx = -1;
+
+            if( type == 0 )
+            {
+                for( int i = 0, j = (int) st.ItemProtos.size(); i < j; i++ )
+                    if( st.ItemProtos[ i ].ProtoId == id ) { idx = i; break; }
+            }
+            else if( type == 1 )
+            {
+                for( int i = 0, j = (int) st.TileHashes.size(); i < j; i++ )
+                    if( st.TileHashes[ i ] == id ) { idx = i; break; }
+            }
+            else if( type == 2 )
+            {
+                for( int i = 0, j = (int) st.NpcProtos.size(); i < j; i++ )
+                    if( st.NpcProtos[ i ]->ProtoId == id ) { idx = i; break; }
+            }
+            if( idx < 0 )
+                continue;
+
+            bool is_default = ( ( *it ).first == DEFAULT_SUB_TAB );
+            bool is_main = ( mode == INT_MODE_ITEM || mode == INT_MODE_TILE || mode == INT_MODE_CRIT );
+            int  score;
+            if( mode == INT_MODE_FAST )
+                score = 4;
+            else if( !is_default )
+                score = 3;
+            else
+                score = is_main ? 1 : 2;
+
+            if( score > best_score )
+            {
+                best_score = score;
+                best_mode = mode;
+                best_stab = &st;
+                best_index = idx;
+            }
+        }
+    }
+
+    if( best_mode < 0 )
+        return false;
+
+    SubTabsActive = false;
+    IntMode = best_mode;
+    IntHold = INT_NONE;
+    TabsActive[ best_mode ] = best_stab;
+    RefreshCurProtos();
+    SetTabIndex( best_index );
+    if( CurProtoScroll )
+    {
+        int scroll = best_index - (int) ProtosOnScreen / 2;
+        *CurProtoScroll = scroll > 0 ? scroll : 0;
+    }
+    SelectClear();
+    CurMode = CUR_MODE_PLACE_OBJECT;
+    return true;
+}
+
+// Pipette: pick whatever is under the cursor and show it in the panel (used by the Brush spray tool)
+void FOMapper::PipCursorObj()
+{
+    if( !CurProtoMap )
+        return;
+
+    ItemHex*   item = NULL;
+    CritterCl* cr = NULL;
+    HexMngr.GetSmthPixel( GameOpt.MouseX, GameOpt.MouseY, item, cr );
+
+    if( item )
+    {
+        ushort pid = item->GetProtoId();
+        if( pid )
+            SelectAssetInPanel( 0, pid );
+    }
+    else if( cr )
+    {
+        MapObject* mobj = FindMapObject( cr->GetHexX(), cr->GetHexY(), MAP_OBJECT_CRITTER, cr->Flags, false );
+        if( mobj && mobj->ProtoId )
+            SelectAssetInPanel( 2, mobj->ProtoId );
+    }
+    else
+    {
+        ushort hx = 0, hy = 0;
+        if( !HexMngr.GetHexPixel( GameOpt.MouseX, GameOpt.MouseY, hx, hy ) )
+            return;
+
+        // Tiles can sit on any hex, so try the exact hex, the even-aligned hex, then the left/up neighbours
+        const int cand[ 5 ][ 2 ] = {
+            { hx, hy },
+            { ( hx >> 1 ) * 2, ( hy >> 1 ) * 2 },
+            { hx - 1, hy }, { hx, hy - 1 }, { hx - 1, hy - 1 }
+        };
+
+        ProtoMap::TileVec* tiles = NULL;
+        bool roof = false;
+        for( int pass = 0; pass < 2 && !tiles; pass++ )
+        {
+            roof = ( pass == 1 );
+            if( roof && !GameOpt.ShowRoof )
+                break;
+            for( int i = 0; i < 5; i++ )
+            {
+                int cx = cand[ i ][ 0 ], cy = cand[ i ][ 1 ];
+                if( cx < 0 || cy < 0 || cx >= HexMngr.GetMaxHexX() || cy >= HexMngr.GetMaxHexY() )
+                    continue;
+                ProtoMap::TileVec& tv = CurProtoMap->GetTiles( (ushort) cx, (ushort) cy, roof );
+                if( !tv.empty() )
+                {
+                    tiles = &tv;
+                    break;
+                }
+            }
+        }
+        if( !tiles )
+            return;
+
+        uint hash = ( *tiles )[ 0 ].NameHash;
+        int  layer = ( *tiles )[ 0 ].Layer;
+        if( hash && SelectAssetInPanel( 1, hash ) )
+        {
+            DrawRoof = roof;
+            TileLayer = layer;
+        }
+    }
 }
 
 void FOMapper::RefreshCurProtos()
